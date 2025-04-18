@@ -266,7 +266,6 @@ void bit_reverse_radix4(std::vector<uint64_t> &a, int n)
         temp >>= 2;
         log4n++;
     }
-    std::vector<uint64_t> rev(n, 0);
     for (int i = 0; i < n; ++i) 
     {
         int reversed = 0;
@@ -276,13 +275,9 @@ void bit_reverse_radix4(std::vector<uint64_t> &a, int n)
             reversed = (reversed << 2) | (num & 3);
             num >>= 2;
         }
-        rev[i] = reversed;
-    }
-    for (int i = 0; i < n; ++i) 
-    {
-        if (i < rev[i]) 
+        if (i < reversed) 
         {
-            std::swap(a[i], a[rev[i]]);
+            std::swap(a[i], a[reversed]);
         }
     }
 }
@@ -299,46 +294,39 @@ void NTT_radix4(std::vector<uint64_t> &a,int n, int p, int inv)
     for (int len = 4; len <= n;len<<= 2) 
     {
         int step = len >> 2;
-        uint64_t w1 = power(g, (p - 1) / len, p);
+        uint64_t w = power(g, (p - 1) / len, p);
         if(inv == -1)
         {
-            w1 = power(w1, p - 2, p);
+            w = power(w, p - 2, p);
         }
-        uint64_t w2 = (1ULL * w1 * w1) % p;
-        uint64_t w3 = (1ULL * w2 * w1) % p;
+        uint64_t imag = power(w, step, p);
 
         for (int i = 0; i < n;i+=len)
         {
-            std::vector<uint64_t> w1_powers(step), w2_powers(step), w3_powers(step);
-            w1_powers[0] = w2_powers[0] = w3_powers[0] = 1;
-            for (int j = 1; j < step; ++j)
+            uint64_t w1 = 1, w2 = 1, w3 = 1;
+            for (int j = 0; j < step; ++j)
             {
-                w1_powers[j] = m.ModMul(w1_powers[j - 1], w1);
-                w2_powers[j] = m.ModMul(w2_powers[j - 1], w2);
-                w3_powers[j] = m.ModMul(w3_powers[j - 1], w3);
+                uint64_t a0 = a[i + j];
+                uint64_t a1 = m.ModMul(a[i + j + step], w1);
+                uint64_t a2 = m.ModMul(a[i + j + 2 * step], w2);
+                uint64_t a3 = m.ModMul(a[i + j + 3 * step], w3);
 
-                uint64_t x0 = a[i + j];
-                uint64_t x1 = a[i + j + step];
-                uint64_t x2 = a[i + j + 2 * step];
-                uint64_t x3 = a[i + j + 3 * step];
+                uint64_t a1i = m.ModMul(a1, imag);
+                uint64_t a3i = m.ModMul(a3, imag);
 
-                // uint64_t t1 = m.ModMul(x1, power(w1, j, p));
-                // uint64_t t2 = m.ModMul(x2, power(w2, j, p));
-                // uint64_t t3 = m.ModMul(x3, power(w3, j, p));
+                uint64_t y0 = (a0 + a1 + a2 + a3) % p;
+                uint64_t y1 = (a0 + a1i + p - a2 + p - a3i) % p;
+                uint64_t y2 = (a0 + p - a1 + a2 + p - a3) % p;
+                uint64_t y3 = (a0 + p - a1i + p - a2 + a3i) % p;
 
-                uint64_t t1 = m.ModMul(x1, w1_powers[j]);
-                uint64_t t2 = m.ModMul(x2, w2_powers[j]);
-                uint64_t t3 = m.ModMul(x3, w3_powers[j]);
+                a[i + j] = y0;
+                a[i + j + step] = y1;
+                a[i + j + 2 * step] = y2;
+                a[i + j + 3 * step] = y3;
 
-                uint64_t s0 = (x0 + t2) % p;
-                uint64_t s1 = (x0 + p - t2) % p;
-                uint64_t s2 = (t1 + p - t3) % p;
-                uint64_t s3 = (t1 + t3) % p;
-
-                a[i + j] = (s0 + s3) % p;
-                a[i + j + step] = (s1 + s2) % p;
-                a[i + j + 2 * step] = (s0 + p - s3) % p;
-                a[i + j + 3 * step] = (s1 + p - s2) % p;
+                w1 = m.ModMul(w1, w);
+                w2 = m.ModMul(w2, m.ModMul(w, w));
+                w3 = m.ModMul(w3, m.ModMul(m.ModMul(w, w), w));
             }
         }
     }
@@ -374,7 +362,7 @@ int main(int argc, char *argv[])
         int len = 1;
         while(len<2*n_)
         {
-            len <<= 1;
+            len <<= 2;
         }
         std::vector<uint64_t> a_1(len, 0);
         std::vector<uint64_t> b_1(len, 0);
