@@ -352,7 +352,7 @@ int main(int argc, char *argv[])
     // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
     // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
     int test_begin = 0;
-    int test_end = 1;
+    int test_end = 4;
     for(int i = test_begin; i <= test_end; ++i){
         long double ans = 0;
         int n_, p_;
