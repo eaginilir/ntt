@@ -192,23 +192,6 @@ public:
         return REDC((__uint128_t)x);
     }
 
-    inline uint64x2_t MontMulRaw_neon(const montgomery &m,uint64x2_t aR, uint64x2_t bR) 
-    {
-        uint32x2_t a32 = vmovn_u64(aR);
-        uint32x2_t b32 = vmovn_u64(bR);
-        uint64x2_t prod = vmull_u32(a32, b32);
-
-        uint64_t t0 = vgetq_lane_u64(prod, 0);
-        uint64_t t1 = vgetq_lane_u64(prod, 1);
-        uint64_t r0 = REDC((__uint128_t)t0);
-        uint64_t r1 = REDC((__uint128_t)t1);
-
-        uint64x2_t res = vdupq_n_u64(0);
-        res = vsetq_lane_u64(r0, res, 0);
-        res = vsetq_lane_u64(r1, res, 1);
-        return res;
-    }
-
     uint64_t ModMul(uint64_t a, uint64_t b) 
     {
         // if(a>=N||b>=N)
@@ -216,6 +199,21 @@ public:
         //     throw std::invalid_argument("input integer must be smaller than the modulus N");
         // }
         return REDC((__uint128_t)a * b);
+    }
+
+    inline uint64_t add(uint64_t a, uint64_t b) const 
+    {
+        uint64_t res = a + b;
+        if (res >= N || res < a) 
+        {
+            res -= N;
+        }
+        return res;
+    }
+
+    inline uint64_t sub(uint64_t a, uint64_t b) const 
+    {
+        return (a >= b) ? (a - b) : (N - (b - a));
     }
 public:
     uint64_t N, R, R2, N_inv_neg;
@@ -344,7 +342,7 @@ void NTT_radix4(std::vector<uint64_t> &a,int n, int p, int inv)
                 uint64_t a2R = a[i+j+2*step];
                 uint64_t a3R = a[i+j+3*step];
 
-                // 2) Montgomery 域乘法
+                //Montgomery域乘法
                 uint64_t t1R = m.ModMul(a1R, w1R);
                 uint64_t t2R = m.ModMul(a2R, w2R_lane);
                 uint64_t t3R = m.ModMul(a3R, w3R_lane);
@@ -352,15 +350,15 @@ void NTT_radix4(std::vector<uint64_t> &a,int n, int p, int inv)
                 uint64_t t1iR = m.ModMul(t1R, imagR);
                 uint64_t t3iR = m.ModMul(t3R, imagR);
 
-                uint64_t y0 = (m.fromMont(a0R) + m.fromMont(t1R) + m.fromMont(t2R) + m.fromMont(t3R)) % p;
-                uint64_t y1 = (m.fromMont(a0R) + m.fromMont(t1iR) + p - m.fromMont(t2R) + p - m.fromMont(t3iR)) % p;
-                uint64_t y2 = (m.fromMont(a0R) + p - m.fromMont(t1R) + m.fromMont(t2R) + p - m.fromMont(t3R)) % p;
-                uint64_t y3 = (m.fromMont(a0R) + p - m.fromMont(t1iR) + p - m.fromMont(t2R) + m.fromMont(t3iR)) % p;
+                uint64_t y0R = m.add(m.add(m.add(a0R, t1R), t2R), t3R);
+                uint64_t y1R = m.sub(m.sub(m.add(a0R, t1iR), t2R), t3iR);
+                uint64_t y2R = m.sub(m.add(m.sub(a0R, t1R), t2R), t3R);
+                uint64_t y3R = m.add(m.sub(m.sub(a0R, t1iR), t2R), t3iR);
 
-                a[i + j] = m.toMont(y0);
-                a[i + j + step] = m.toMont(y1);
-                a[i + j + 2 * step] = m.toMont(y2);
-                a[i + j + 3 * step] = m.toMont(y3);
+                a[i + j] = y0R;
+                a[i + j + step] = y1R;
+                a[i + j + 2 * step] = y2R;
+                a[i + j + 3 * step] = y3R;
 
                 w1R = m.ModMul(w1R, wR);
                 w2R_lane = m.ModMul(w2R_lane, w2R);
