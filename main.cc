@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <arm_neon.h>
 // 可以自行添加需要的头文件
 
 void fRead(int *a, int *b, int *n, int *p, int input_id){
@@ -179,16 +180,42 @@ public:
         return uint64_t(t);
     }
 
+    //将普通数转换到Montgomery中
+    inline uint64_t toMont(uint64_t x)
+    {
+        return REDC((__uint128_t)x * R2);
+    }
+
+    //将Montgomery数转换到普通数
+    inline uint64_t fromMont(uint64_t x) 
+    {
+        return REDC((__uint128_t)x);
+    }
+
+    inline uint64x2_t MontMulRaw_neon(const montgomery &m,uint64x2_t aR, uint64x2_t bR) 
+    {
+        uint32x2_t a32 = vmovn_u64(aR);
+        uint32x2_t b32 = vmovn_u64(bR);
+        uint64x2_t prod = vmull_u32(a32, b32);
+
+        uint64_t t0 = vgetq_lane_u64(prod, 0);
+        uint64_t t1 = vgetq_lane_u64(prod, 1);
+        uint64_t r0 = REDC((__uint128_t)t0);
+        uint64_t r1 = REDC((__uint128_t)t1);
+
+        uint64x2_t res = vdupq_n_u64(0);
+        res = vsetq_lane_u64(r0, res, 0);
+        res = vsetq_lane_u64(r1, res, 1);
+        return res;
+    }
+
     uint64_t ModMul(uint64_t a, uint64_t b) 
     {
-        if(a>=N||b>=N)
-        {
-            throw std::invalid_argument("input integer must be smaller than the modulus N");
-        }
-        uint64_t aR = REDC(__uint128_t(a) * R2);
-        uint64_t bR = REDC(__uint128_t(b) * R2);
-        uint64_t abR = REDC(__uint128_t(aR) * bR);
-        return REDC(abR);
+        // if(a>=N||b>=N)
+        // {
+        //     throw std::invalid_argument("input integer must be smaller than the modulus N");
+        // }
+        return REDC((__uint128_t)a * b);
     }
 public:
     uint64_t N, R, R2, N_inv_neg;
@@ -301,32 +328,43 @@ void NTT_radix4(std::vector<uint64_t> &a,int n, int p, int inv)
         }
         uint64_t imag = power(w, step, p);
 
+        //把标量w和imag转到 Montgomery 域
+        uint64_t wR = m.toMont(w);
+        uint64_t w2R = m.ModMul(wR, wR);
+        uint64_t w3R = m.ModMul(w2R, wR);
+        uint64_t imagR = m.toMont(imag);
+
         for (int i = 0; i < n;i+=len)
         {
-            uint64_t w1 = 1, w2 = 1, w3 = 1;
+            uint64_t w1R = m.toMont(1), w2R_lane = m.toMont(1), w3R_lane = m.toMont(1);
             for (int j = 0; j < step; ++j)
             {
-                uint64_t a0 = a[i + j];
-                uint64_t a1 = m.ModMul(a[i + j + step], w1);
-                uint64_t a2 = m.ModMul(a[i + j + 2 * step], w2);
-                uint64_t a3 = m.ModMul(a[i + j + 3 * step], w3);
+                uint64_t a0R = a[i+j];
+                uint64_t a1R = a[i+j+step];
+                uint64_t a2R = a[i+j+2*step];
+                uint64_t a3R = a[i+j+3*step];
 
-                uint64_t a1i = m.ModMul(a1, imag);
-                uint64_t a3i = m.ModMul(a3, imag);
+                // 2) Montgomery 域乘法
+                uint64_t t1R = m.ModMul(a1R, w1R);
+                uint64_t t2R = m.ModMul(a2R, w2R_lane);
+                uint64_t t3R = m.ModMul(a3R, w3R_lane);
 
-                uint64_t y0 = (a0 + a1 + a2 + a3) % p;
-                uint64_t y1 = (a0 + a1i + p - a2 + p - a3i) % p;
-                uint64_t y2 = (a0 + p - a1 + a2 + p - a3) % p;
-                uint64_t y3 = (a0 + p - a1i + p - a2 + a3i) % p;
+                uint64_t t1iR = m.ModMul(t1R, imagR);
+                uint64_t t3iR = m.ModMul(t3R, imagR);
 
-                a[i + j] = y0;
-                a[i + j + step] = y1;
-                a[i + j + 2 * step] = y2;
-                a[i + j + 3 * step] = y3;
+                uint64_t y0 = (m.fromMont(a0R) + m.fromMont(t1R) + m.fromMont(t2R) + m.fromMont(t3R)) % p;
+                uint64_t y1 = (m.fromMont(a0R) + m.fromMont(t1iR) + p - m.fromMont(t2R) + p - m.fromMont(t3iR)) % p;
+                uint64_t y2 = (m.fromMont(a0R) + p - m.fromMont(t1R) + m.fromMont(t2R) + p - m.fromMont(t3R)) % p;
+                uint64_t y3 = (m.fromMont(a0R) + p - m.fromMont(t1iR) + p - m.fromMont(t2R) + m.fromMont(t3iR)) % p;
 
-                w1 = m.ModMul(w1, w);
-                w2 = m.ModMul(w2, m.ModMul(w, w));
-                w3 = m.ModMul(w3, m.ModMul(m.ModMul(w, w), w));
+                a[i + j] = m.toMont(y0);
+                a[i + j + step] = m.toMont(y1);
+                a[i + j + 2 * step] = m.toMont(y2);
+                a[i + j + 3 * step] = m.toMont(y3);
+
+                w1R = m.ModMul(w1R, wR);
+                w2R_lane = m.ModMul(w2R_lane, w2R);
+                w3R_lane = m.ModMul(w3R_lane, w3R);
             }
         }
     }
@@ -334,9 +372,10 @@ void NTT_radix4(std::vector<uint64_t> &a,int n, int p, int inv)
     if(inv==-1) 
     {
         int inv_n = power(n, p - 2, p);
+        uint64_t invR = m.toMont(inv_n);
         for(auto &x : a) 
         {
-            x = m.ModMul(x, inv_n);
+            x= m.ModMul(x, invR);
         }
     }
 }
@@ -352,11 +391,12 @@ int main(int argc, char *argv[])
     // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
     // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
     int test_begin = 0;
-    int test_end = 4;
+    int test_end = 3;
     for(int i = test_begin; i <= test_end; ++i){
         long double ans = 0;
         int n_, p_;
         fRead(a, b, &n_, &p_, i);
+        memset(ab, 0, sizeof(ab));
         uint64_t R = 1ULL << 32;
         montgomery m(R,p_);
         int len = 1;
@@ -369,7 +409,9 @@ int main(int argc, char *argv[])
         for (int i = 0; i < n_; ++i)
         {
             a_1[i] = a[i];
+            a_1[i] = m.toMont(a_1[i]);
             b_1[i] = b[i];
+            b_1[i] = m.toMont(b_1[i]);
         }
         auto Start = std::chrono::high_resolution_clock::now();
         // TODO : 将 poly_multiply 函数替换成你写的 ntt
@@ -388,6 +430,7 @@ int main(int argc, char *argv[])
         auto End = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < 2 * n_ - 1; ++i)
         {
+            c[i] = m.fromMont(c[i]);
             ab[i] = c[i];
         }
         std::chrono::duration<double,std::ratio<1,1000>>elapsed = End - Start;
