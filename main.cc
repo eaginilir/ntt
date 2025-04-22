@@ -139,6 +139,9 @@ public:
         uint64_t N_inv = modinv(N, R);
         N_inv_neg = R - N_inv;
         R2 = (__uint128_t(R) * R) % N;
+        vec_modulus = vdupq_n_u64(N);
+        vec_inv = vdupq_n_u64(N_inv);
+        vec_R2 = vdupq_n_u64(R2);
     }
 
     static uint64_t gcd_extended(uint64_t a, uint64_t b, int64_t &x, int64_t &y) 
@@ -248,9 +251,105 @@ public:
         res[i + 1] = REDC((__uint128_t)vgetq_lane_u64(result, 1));
         }
     }
+
+    void addSIMD(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, std::vector<uint64_t> &res)
+    {
+        size_t n = a.size();
+        res.resize(n);
+        uint64x2_t mod = vdupq_n_u64(N);
+    
+        for (size_t i = 0; i < n; i += 2) 
+        {
+            uint64x2_t va = vld1q_u64(&a[i]);
+            uint64x2_t vb = vld1q_u64(&b[i]);
+            uint64x2_t vres = vaddq_u64(va, vb);
+    
+            // 检查是否溢出，进行条件减法
+            uint64x2_t overflow = vcgeq_u64(vres, mod);
+            uint64x2_t vmod = vandq_u64(overflow, mod); // 需要减 N 的位置为 N，否则为 0
+            vres = vsubq_u64(vres, vmod);
+    
+            vst1q_u64(&res[i], vres);
+        }
+    }
+
+    void subSIMD(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, std::vector<uint64_t> &res)
+    {
+        size_t n = a.size();
+        res.resize(n);
+        uint64x2_t mod = vdupq_n_u64(N);
+    
+        for (size_t i = 0; i < n; i += 2) {
+            uint64x2_t va = vld1q_u64(&a[i]);
+            uint64x2_t vb = vld1q_u64(&b[i]);
+    
+            uint64x2_t vres = vsubq_u64(va, vb);
+            uint64x2_t underflow = vcgtq_u64(vb, va);  // 如果 b > a，则需要补 mod
+            uint64x2_t vmod = vandq_u64(underflow, mod);
+            vres = vaddq_u64(vres, vmod);
+    
+            vst1q_u64(&res[i], vres);
+        }
+    }
+
+    inline uint64x2_t ModAddSIMD(uint64x2_t a, uint64x2_t b)
+    {
+        uint64x2_t sum = vaddq_u64(a, b);
+        uint64x2_t cmp = vcgeq_u64(sum, vec_modulus);  // sum >= modulus
+        return vbslq_u64(cmp, vsubq_u64(sum, vec_modulus), sum);
+    }
+
+    inline uint64x2_t ModSubSIMD(uint64x2_t a, uint64x2_t b)
+    {
+        uint64x2_t diff = vsubq_u64(a, b);
+        uint64x2_t cmp = vcgtq_u64(b, a);  // b > a
+        return vbslq_u64(cmp, vaddq_u64(diff, vec_modulus), diff);
+    }
+
+    // inline uint64x2_t ModMulSIMD(uint64x2_t a, uint64x2_t b)
+    // {
+    //     uint64_t a0 = vgetq_lane_u64(a, 0);
+    //     uint64_t a1 = vgetq_lane_u64(a, 1);
+    //     uint64_t b0 = vgetq_lane_u64(b, 0);
+    //     uint64_t b1 = vgetq_lane_u64(b, 1);
+    
+    //     uint64_t r0 = ModMul(a0, b0);
+    //     uint64_t r1 = ModMul(a1, b1);
+    
+    //     // return vsetq_lane_u64(r0, vdupq_n_u64(0), 0) | vsetq_lane_u64(r1, vdupq_n_u64(0), 1);
+    //     uint64x2_t result;
+    //     result = vsetq_lane_u64(r0, result, 0);
+    //     result = vsetq_lane_u64(r1, result, 1);
+    //     return result;
+    // }
+
+    inline uint64x2_t ModMulSIMD(uint64x2_t a, uint64x2_t b)
+    {
+        alignas(16) uint64_t a_raw[2], b_raw[2];
+        vst1q_u64(a_raw, a);
+        vst1q_u64(b_raw, b);
+
+        uint64_t r0 = ModMul(a_raw[0], b_raw[0]);
+        uint64_t r1 = ModMul(a_raw[1], b_raw[1]);
+
+        return (uint64x2_t){r0, r1};
+    }
+
+    inline uint64x2_t toMontgomerySIMD(uint64x2_t a)
+    {
+        return ModMulSIMD(a, vec_R2);
+    }
+    
+    inline uint64x2_t fromMontgomerySIMD(uint64x2_t a)
+    {
+        return ModMulSIMD(a, vdupq_n_u64(1));
+    }
 public:
     uint64_t N, R, R2, N_inv_neg;
     int logR;
+    uint64x2_t vec_modulus;
+    uint64x2_t vec_inv;
+    uint64x2_t vec_R2;
 };
 
 //下面是迭代的写法，据说更快（想必更快）
@@ -340,45 +439,91 @@ void bit_reverse_radix4(std::vector<uint64_t> &a, int n)
     }
 }
 
-void NTT_radix4(std::vector<uint64_t> &a,int n, int p, int inv)
-{
+void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv) {
     uint64_t R = 1ULL << 32;
     montgomery m(R, p);
 
     int g = 3;
-    // bit_reverse(a, n);
     bit_reverse_radix4(a, n);
 
-    for (int len = 4; len <= n;len<<= 2) 
-    {
+    for (int len = 4; len <= n; len <<= 2) {
         int step = len >> 2;
         uint64_t w = power(g, (p - 1) / len, p);
-        if(inv == -1)
-        {
+        if (inv == -1) {
             w = power(w, p - 2, p);
         }
         uint64_t imag = power(w, step, p);
 
-        //把标量w和imag转到 Montgomery 域
+        // Convert to Montgomery form
         uint64_t wR = m.toMont(w);
         uint64_t w2R = m.ModMul(wR, wR);
         uint64_t w3R = m.ModMul(w2R, wR);
         uint64_t imagR = m.toMont(imag);
 
-        for (int i = 0; i < n;i+=len)
-        {
-            uint64_t w1R = m.toMont(1), w2R_lane = m.toMont(1), w3R_lane = m.toMont(1);
-            for (int j = 0; j < step; ++j)
-            {
-                uint64_t a0R = a[i+j];
-                uint64_t a1R = a[i+j+step];
-                uint64_t a2R = a[i+j+2*step];
-                uint64_t a3R = a[i+j+3*step];
+        for (int i = 0; i < n; i += len) {
+            uint64_t w1R_current = m.toMont(1);
+            uint64_t w2R_lane_current = m.toMont(1);
+            uint64_t w3R_lane_current = m.toMont(1);
 
-                //Montgomery域乘法
-                uint64_t t1R = m.ModMul(a1R, w1R);
-                uint64_t t2R = m.ModMul(a2R, w2R_lane);
-                uint64_t t3R = m.ModMul(a3R, w3R_lane);
+            for (int j = 0; j < step; j += 2) {
+                if (j + 1 >= step) break; // 处理奇数step时的边界
+
+                // 生成旋转因子向量
+                uint64_t w1R_j1 = m.ModMul(w1R_current, wR);
+                uint64x2_t w1R_vec = vcombine_u64(vcreate_u64(w1R_current), vcreate_u64(w1R_j1));
+
+                uint64_t w2R_j1 = m.ModMul(w2R_lane_current, w2R);
+                uint64x2_t w2R_lane_vec = vcombine_u64(vcreate_u64(w2R_lane_current), vcreate_u64(w2R_j1));
+
+                uint64_t w3R_j1 = m.ModMul(w3R_lane_current, w3R);
+                uint64x2_t w3R_lane_vec = vcombine_u64(vcreate_u64(w3R_lane_current), vcreate_u64(w3R_j1));
+
+                uint64x2_t imagR_vec = vdupq_n_u64(imagR);
+
+                // 加载数据
+                uint64x2_t a0 = vld1q_u64(&a[i + j]);
+                uint64x2_t a1 = vld1q_u64(&a[i + j + step]);
+                uint64x2_t a2 = vld1q_u64(&a[i + j + 2 * step]);
+                uint64x2_t a3 = vld1q_u64(&a[i + j + 3 * step]);
+
+                // 计算t1, t2, t3
+                uint64x2_t t1 = m.ModMulSIMD(a1, w1R_vec);
+                uint64x2_t t2 = m.ModMulSIMD(a2, w2R_lane_vec);
+                uint64x2_t t3 = m.ModMulSIMD(a3, w3R_lane_vec);
+
+                // 计算中间项
+                uint64x2_t t1i = m.ModMulSIMD(t1, imagR_vec);
+                uint64x2_t t3i = m.ModMulSIMD(t3, imagR_vec);
+
+                // 计算y0-y3
+                uint64x2_t y0 = m.ModAddSIMD(m.ModAddSIMD(m.ModAddSIMD(a0, t1), t2), t3);
+                uint64x2_t y1 = m.ModSubSIMD(m.ModSubSIMD(m.ModAddSIMD(a0, t1i), t2), t3i);
+                uint64x2_t y2 = m.ModSubSIMD(m.ModAddSIMD(m.ModSubSIMD(a0, t1), t2), t3);
+                uint64x2_t y3 = m.ModAddSIMD(m.ModSubSIMD(m.ModSubSIMD(a0, t1i), t2), t3i);
+
+                // 存储结果
+                vst1q_u64(&a[i + j], y0);
+                vst1q_u64(&a[i + j + step], y1);
+                vst1q_u64(&a[i + j + 2 * step], y2);
+                vst1q_u64(&a[i + j + 3 * step], y3);
+
+                // 更新旋转因子
+                w1R_current = m.ModMul(w1R_current, m.ModMul(wR, wR));
+                w2R_lane_current = m.ModMul(w2R_lane_current, m.ModMul(w2R, w2R));
+                w3R_lane_current = m.ModMul(w3R_lane_current, m.ModMul(w3R, w3R));
+            }
+
+            // 处理剩余的j（step为奇数）
+            if (step % 2 != 0) {
+                int j = step - 1;
+                uint64_t a0R = a[i + j];
+                uint64_t a1R = a[i + j + step];
+                uint64_t a2R = a[i + j + 2 * step];
+                uint64_t a3R = a[i + j + 3 * step];
+
+                uint64_t t1R = m.ModMul(a1R, w1R_current);
+                uint64_t t2R = m.ModMul(a2R, w2R_lane_current);
+                uint64_t t3R = m.ModMul(a3R, w3R_lane_current);
 
                 uint64_t t1iR = m.ModMul(t1R, imagR);
                 uint64_t t3iR = m.ModMul(t3R, imagR);
@@ -392,21 +537,18 @@ void NTT_radix4(std::vector<uint64_t> &a,int n, int p, int inv)
                 a[i + j + step] = y1R;
                 a[i + j + 2 * step] = y2R;
                 a[i + j + 3 * step] = y3R;
-
-                w1R = m.ModMul(w1R, wR);
-                w2R_lane = m.ModMul(w2R_lane, w2R);
-                w3R_lane = m.ModMul(w3R_lane, w3R);
             }
         }
     }
 
-    if(inv==-1) 
-    {
+    if (inv == -1) {
         int inv_n = power(n, p - 2, p);
         uint64_t invR = m.toMont(inv_n);
-        for(auto &x : a) 
-        {
-            x= m.ModMul(x, invR);
+        uint64x2_t invR_vec = vdupq_n_u64(invR);
+        for (size_t i = 0; i < a.size(); i += 2) {
+            uint64x2_t x = vld1q_u64(&a[i]);
+            x = m.ModMulSIMD(x, invR_vec);
+            vst1q_u64(&a[i], x);
         }
     }
 }
