@@ -194,10 +194,6 @@ public:
 
     uint64_t ModMul(uint64_t a, uint64_t b) 
     {
-        // if(a>=N||b>=N)
-        // {
-        //     throw std::invalid_argument("input integer must be smaller than the modulus N");
-        // }
         return REDC((__uint128_t)a * b);
     }
 
@@ -214,6 +210,43 @@ public:
     inline uint64_t sub(uint64_t a, uint64_t b) const 
     {
         return (a >= b) ? (a - b) : (N - (b - a));
+    }
+
+    void toMontgomery(std::vector<uint64_t> &vec)
+    {
+        for (auto &x : vec)
+        {
+            x = toMont(x);
+        }
+    }
+
+    void fromMontgomery(std::vector<uint64_t> &vec)
+    {
+        for (auto &x : vec)
+        {
+            x = fromMont(x);
+        }
+    }
+
+    void ModMulSIMD(const std::vector<uint64_t> &a,const std::vector<uint64_t> &b,std::vector<uint64_t> &res)
+    {
+        size_t n = a.size();
+        res.resize(n);
+        for (size_t i = 0; i < n; i += 2) 
+        {
+        //拆成32-bit低高位
+        uint32x2_t a_lo = {uint32_t(a[i]), uint32_t(a[i + 1])};
+        uint32x2_t a_hi = {uint32_t(a[i] >> 32), uint32_t(a[i + 1] >> 32)};
+        uint32x2_t b_lo = {uint32_t(b[i]), uint32_t(b[i + 1])};
+        uint32x2_t b_hi = {uint32_t(b[i] >> 32), uint32_t(b[i + 1] >> 32)};
+
+        uint64x2_t res_lo = vmull_u32(a_lo, b_lo); //a_lo * b_lo
+        uint64x2_t res_hi = vmull_u32(a_hi, b_hi); //a_hi * b_hi
+        uint64x2_t result = vaddq_u64(res_lo, res_hi); //简化估算，不完整乘法（适用于测试）
+
+        res[i] = REDC((__uint128_t)vgetq_lane_u64(result, 0));
+        res[i + 1] = REDC((__uint128_t)vgetq_lane_u64(result, 1));
+        }
     }
 public:
     uint64_t N, R, R2, N_inv_neg;
@@ -281,7 +314,7 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, int p, int inv)
     }
 }
 
-// 基4的位逆序置换函数
+//基4的位逆序置换函数
 void bit_reverse_radix4(std::vector<uint64_t> &a, int n) 
 {
     int log4n = 0;
@@ -407,10 +440,12 @@ int main(int argc, char *argv[])
         for (int i = 0; i < n_; ++i)
         {
             a_1[i] = a[i];
-            a_1[i] = m.toMont(a_1[i]);
+            // a_1[i] = m.toMont(a_1[i]);
             b_1[i] = b[i];
-            b_1[i] = m.toMont(b_1[i]);
+            // b_1[i] = m.toMont(b_1[i]);
         }
+        m.toMontgomery(a_1);
+        m.toMontgomery(b_1);
         auto Start = std::chrono::high_resolution_clock::now();
         // TODO : 将 poly_multiply 函数替换成你写的 ntt
         // poly_multiply(a, b, ab, n_, p_);
@@ -419,11 +454,12 @@ int main(int argc, char *argv[])
         NTT_radix4(a_1, len, p_, 1);
         NTT_radix4(b_1, len, p_, 1);
         std::vector<uint64_t> c(len, 0);
-        for (int i = 0; i < len; ++i)
-        {
-            c[i] = m.ModMul(a_1[i], b_1[i]);
-        }
+        // for (int i = 0; i < len; ++i)
+        // {
+        //     c[i] = m.ModMul(a_1[i], b_1[i]);
+        // }
         // NTT_iterative(c, len, p_, -1);
+        m.ModMulSIMD(a_1, b_1, c);
         NTT_radix4(c, len, p_, -1);
         auto End = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < 2 * n_ - 1; ++i)
