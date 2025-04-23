@@ -306,23 +306,6 @@ public:
         return vbslq_u64(cmp, vaddq_u64(diff, vec_modulus), diff);
     }
 
-    // inline uint64x2_t ModMulSIMD(uint64x2_t a, uint64x2_t b)
-    // {
-    //     uint64_t a0 = vgetq_lane_u64(a, 0);
-    //     uint64_t a1 = vgetq_lane_u64(a, 1);
-    //     uint64_t b0 = vgetq_lane_u64(b, 0);
-    //     uint64_t b1 = vgetq_lane_u64(b, 1);
-    
-    //     uint64_t r0 = ModMul(a0, b0);
-    //     uint64_t r1 = ModMul(a1, b1);
-    
-    //     // return vsetq_lane_u64(r0, vdupq_n_u64(0), 0) | vsetq_lane_u64(r1, vdupq_n_u64(0), 1);
-    //     uint64x2_t result;
-    //     result = vsetq_lane_u64(r0, result, 0);
-    //     result = vsetq_lane_u64(r1, result, 1);
-    //     return result;
-    // }
-
     inline uint64x2_t ModMulSIMD(uint64x2_t a, uint64x2_t b)
     {
         alignas(16) uint64_t a_raw[2], b_raw[2];
@@ -439,36 +422,37 @@ void bit_reverse_radix4(std::vector<uint64_t> &a, int n)
     }
 }
 
-void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv) {
-    uint64_t R = 1ULL << 32;
-    montgomery m(R, p);
-
+void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv,montgomery &m) 
+{
     int g = 3;
     bit_reverse_radix4(a, n);
 
-    for (int len = 4; len <= n; len <<= 2) {
+    for (int len = 4; len <= n; len <<= 2) 
+    {
         int step = len >> 2;
         uint64_t w = power(g, (p - 1) / len, p);
-        if (inv == -1) {
+        if (inv == -1) 
+        {
             w = power(w, p - 2, p);
         }
         uint64_t imag = power(w, step, p);
 
-        // Convert to Montgomery form
         uint64_t wR = m.toMont(w);
         uint64_t w2R = m.ModMul(wR, wR);
         uint64_t w3R = m.ModMul(w2R, wR);
         uint64_t imagR = m.toMont(imag);
 
-        for (int i = 0; i < n; i += len) {
+        for (int i = 0; i < n; i += len) 
+        {
             uint64_t w1R_current = m.toMont(1);
             uint64_t w2R_lane_current = m.toMont(1);
             uint64_t w3R_lane_current = m.toMont(1);
 
-            for (int j = 0; j < step; j += 2) {
-                if (j + 1 >= step) break; // 处理奇数step时的边界
+            for (int j = 0; j < step; j += 2) 
+            {
+                if (j + 1 >= step) break; //处理奇数step时的边界
 
-                // 生成旋转因子向量
+                //生成旋转因子向量
                 uint64_t w1R_j1 = m.ModMul(w1R_current, wR);
                 uint64x2_t w1R_vec = vcombine_u64(vcreate_u64(w1R_current), vcreate_u64(w1R_j1));
 
@@ -480,41 +464,41 @@ void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv) {
 
                 uint64x2_t imagR_vec = vdupq_n_u64(imagR);
 
-                // 加载数据
+                //加载数据
                 uint64x2_t a0 = vld1q_u64(&a[i + j]);
                 uint64x2_t a1 = vld1q_u64(&a[i + j + step]);
                 uint64x2_t a2 = vld1q_u64(&a[i + j + 2 * step]);
                 uint64x2_t a3 = vld1q_u64(&a[i + j + 3 * step]);
 
-                // 计算t1, t2, t3
+                //计算t1, t2, t3
                 uint64x2_t t1 = m.ModMulSIMD(a1, w1R_vec);
                 uint64x2_t t2 = m.ModMulSIMD(a2, w2R_lane_vec);
                 uint64x2_t t3 = m.ModMulSIMD(a3, w3R_lane_vec);
 
-                // 计算中间项
+                //计算中间项
                 uint64x2_t t1i = m.ModMulSIMD(t1, imagR_vec);
                 uint64x2_t t3i = m.ModMulSIMD(t3, imagR_vec);
 
-                // 计算y0-y3
+                //计算y0-y3
                 uint64x2_t y0 = m.ModAddSIMD(m.ModAddSIMD(m.ModAddSIMD(a0, t1), t2), t3);
                 uint64x2_t y1 = m.ModSubSIMD(m.ModSubSIMD(m.ModAddSIMD(a0, t1i), t2), t3i);
                 uint64x2_t y2 = m.ModSubSIMD(m.ModAddSIMD(m.ModSubSIMD(a0, t1), t2), t3);
                 uint64x2_t y3 = m.ModAddSIMD(m.ModSubSIMD(m.ModSubSIMD(a0, t1i), t2), t3i);
 
-                // 存储结果
+                //存储结果
                 vst1q_u64(&a[i + j], y0);
                 vst1q_u64(&a[i + j + step], y1);
                 vst1q_u64(&a[i + j + 2 * step], y2);
                 vst1q_u64(&a[i + j + 3 * step], y3);
 
-                // 更新旋转因子
+                //更新旋转因子
                 w1R_current = m.ModMul(w1R_current, m.ModMul(wR, wR));
                 w2R_lane_current = m.ModMul(w2R_lane_current, m.ModMul(w2R, w2R));
                 w3R_lane_current = m.ModMul(w3R_lane_current, m.ModMul(w3R, w3R));
             }
-
-            // 处理剩余的j（step为奇数）
-            if (step % 2 != 0) {
+            //处理剩余的j（step为奇数）
+            if (step % 2 != 0) 
+            {
                 int j = step - 1;
                 uint64_t a0R = a[i + j];
                 uint64_t a1R = a[i + j + step];
@@ -540,12 +524,13 @@ void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv) {
             }
         }
     }
-
-    if (inv == -1) {
+    if (inv == -1) 
+    {
         int inv_n = power(n, p - 2, p);
         uint64_t invR = m.toMont(inv_n);
         uint64x2_t invR_vec = vdupq_n_u64(invR);
-        for (size_t i = 0; i < a.size(); i += 2) {
+        for (size_t i = 0; i < a.size(); i += 2) 
+        {
             uint64x2_t x = vld1q_u64(&a[i]);
             x = m.ModMulSIMD(x, invR_vec);
             vst1q_u64(&a[i], x);
@@ -582,9 +567,7 @@ int main(int argc, char *argv[])
         for (int i = 0; i < n_; ++i)
         {
             a_1[i] = a[i];
-            // a_1[i] = m.toMont(a_1[i]);
             b_1[i] = b[i];
-            // b_1[i] = m.toMont(b_1[i]);
         }
         m.toMontgomery(a_1);
         m.toMontgomery(b_1);
@@ -593,16 +576,16 @@ int main(int argc, char *argv[])
         // poly_multiply(a, b, ab, n_, p_);
         // NTT_iterative(a_1, len, p_, 1);
         // NTT_iterative(b_1, len, p_, 1);
-        NTT_radix4(a_1, len, p_, 1);
-        NTT_radix4(b_1, len, p_, 1);
+        NTT_radix4(a_1, len, p_, 1, m);
+        NTT_radix4(b_1, len, p_, 1, m);
         std::vector<uint64_t> c(len, 0);
         // for (int i = 0; i < len; ++i)
-        // {
+        // {    
         //     c[i] = m.ModMul(a_1[i], b_1[i]);
         // }
         // NTT_iterative(c, len, p_, -1);
         m.ModMulSIMD(a_1, b_1, c);
-        NTT_radix4(c, len, p_, -1);
+        NTT_radix4(c, len, p_, -1, m);
         auto End = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < 2 * n_ - 1; ++i)
         {
