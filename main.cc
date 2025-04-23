@@ -94,6 +94,7 @@ uint64_t power(int base, int exp, int mod)
     return res;
 }
 
+//不用看下面这个递归版本，这个版本还没测试过
 std::vector<int> NTT_recursive(std::vector<int> &a,int n,int p,int inv)
 {
     if(n==1)//长度为0，直接返回
@@ -129,7 +130,6 @@ std::vector<int> NTT_recursive(std::vector<int> &a,int n,int p,int inv)
     return result;
 }
 
-//如果是逆运算整个结果要除n
 class montgomery
 {
 public:
@@ -569,27 +569,19 @@ int main(int argc, char *argv[])
             a_1[i] = a[i];
             b_1[i] = b[i];
         }
-        m.toMontgomery(a_1);
-        m.toMontgomery(b_1);
+        std::vector<uint64_t> c(len, 0);
         auto Start = std::chrono::high_resolution_clock::now();
         // TODO : 将 poly_multiply 函数替换成你写的 ntt
-        // poly_multiply(a, b, ab, n_, p_);
-        // NTT_iterative(a_1, len, p_, 1);
-        // NTT_iterative(b_1, len, p_, 1);
+        m.toMontgomery(a_1);
+        m.toMontgomery(b_1);
         NTT_radix4(a_1, len, p_, 1, m);
         NTT_radix4(b_1, len, p_, 1, m);
-        std::vector<uint64_t> c(len, 0);
-        // for (int i = 0; i < len; ++i)
-        // {    
-        //     c[i] = m.ModMul(a_1[i], b_1[i]);
-        // }
-        // NTT_iterative(c, len, p_, -1);
         m.ModMulSIMD(a_1, b_1, c);
         NTT_radix4(c, len, p_, -1, m);
+        m.fromMontgomery(c);
         auto End = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < 2 * n_ - 1; ++i)
         {
-            c[i] = m.fromMont(c[i]);
             ab[i] = c[i];
         }
         std::chrono::duration<double,std::ratio<1,1000>>elapsed = End - Start;
