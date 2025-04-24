@@ -231,64 +231,57 @@ public:
         }
     }
 
-    void ModMulSIMD(const std::vector<uint64_t> &a,const std::vector<uint64_t> &b,std::vector<uint64_t> &res)
+    //粗略乘法也能过四个测试样例，挺神奇的，可能因为数据都是
+    // void ModMulSIMD(const std::vector<uint64_t> &a,const std::vector<uint64_t> &b,std::vector<uint64_t> &res)
+    // {
+    //     size_t n = a.size();
+    //     res.resize(n);
+    //     for (size_t i = 0; i < n; i += 2) 
+    //     {
+    //     //拆成32-bit低高位
+    //     uint32x2_t a_lo = {uint32_t(a[i]), uint32_t(a[i + 1])};
+    //     uint32x2_t a_hi = {uint32_t(a[i] >> 32), uint32_t(a[i + 1] >> 32)};
+    //     uint32x2_t b_lo = {uint32_t(b[i]), uint32_t(b[i + 1])};
+    //     uint32x2_t b_hi = {uint32_t(b[i] >> 32), uint32_t(b[i + 1] >> 32)};
+
+    //     uint64x2_t res_lo = vmull_u32(a_lo, b_lo); //a_lo * b_lo
+    //     uint64x2_t res_hi = vmull_u32(a_hi, b_hi); //a_hi * b_hi
+    //     uint64x2_t result = vaddq_u64(res_lo, res_hi); //简化估算，不完整乘法（适用于测试）
+
+    //     res[i] = REDC((__uint128_t)vgetq_lane_u64(result, 0));
+    //     res[i + 1] = REDC((__uint128_t)vgetq_lane_u64(result, 1));
+    //     }
+    // }
+
+    //完整版乘法
+    void ModMulSIMD(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, std::vector<uint64_t> &res)
     {
         size_t n = a.size();
         res.resize(n);
         for (size_t i = 0; i < n; i += 2) 
         {
-        //拆成32-bit低高位
-        uint32x2_t a_lo = {uint32_t(a[i]), uint32_t(a[i + 1])};
-        uint32x2_t a_hi = {uint32_t(a[i] >> 32), uint32_t(a[i + 1] >> 32)};
-        uint32x2_t b_lo = {uint32_t(b[i]), uint32_t(b[i + 1])};
-        uint32x2_t b_hi = {uint32_t(b[i] >> 32), uint32_t(b[i + 1] >> 32)};
+            //拆分为 32-bit 高低位
+            uint32x2_t a_lo = {uint32_t(a[i]), uint32_t(a[i + 1])};
+            uint32x2_t a_hi = {uint32_t(a[i] >> 32), uint32_t(a[i + 1] >> 32)};
+            uint32x2_t b_lo = {uint32_t(b[i]), uint32_t(b[i + 1])};
+            uint32x2_t b_hi = {uint32_t(b[i] >> 32), uint32_t(b[i + 1] >> 32)};
 
-        uint64x2_t res_lo = vmull_u32(a_lo, b_lo); //a_lo * b_lo
-        uint64x2_t res_hi = vmull_u32(a_hi, b_hi); //a_hi * b_hi
-        uint64x2_t result = vaddq_u64(res_lo, res_hi); //简化估算，不完整乘法（适用于测试）
+            //计算各部分乘积
+            uint64x2_t lo = vmull_u32(a_lo, b_lo);
+            uint64x2_t hi = vmull_u32(a_hi, b_hi); 
+            uint64x2_t mid1 = vmull_u32(a_hi, b_lo); 
+            uint64x2_t mid2 = vmull_u32(a_lo, b_hi);
+            uint64x2_t mid = vaddq_u64(mid1, mid2);
 
-        res[i] = REDC((__uint128_t)vgetq_lane_u64(result, 0));
-        res[i + 1] = REDC((__uint128_t)vgetq_lane_u64(result, 1));
-        }
-    }
+            __uint128_t prod0 = (__uint128_t)vgetq_lane_u64(lo, 0);
+            prod0 += (__uint128_t)vgetq_lane_u64(mid, 0) << 32;
+            prod0 += (__uint128_t)vgetq_lane_u64(hi, 0) << 64;
+            res[i] = REDC(prod0);
 
-    void addSIMD(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, std::vector<uint64_t> &res)
-    {
-        size_t n = a.size();
-        res.resize(n);
-        uint64x2_t mod = vdupq_n_u64(N);
-    
-        for (size_t i = 0; i < n; i += 2) 
-        {
-            uint64x2_t va = vld1q_u64(&a[i]);
-            uint64x2_t vb = vld1q_u64(&b[i]);
-            uint64x2_t vres = vaddq_u64(va, vb);
-    
-            // 检查是否溢出，进行条件减法
-            uint64x2_t overflow = vcgeq_u64(vres, mod);
-            uint64x2_t vmod = vandq_u64(overflow, mod); // 需要减 N 的位置为 N，否则为 0
-            vres = vsubq_u64(vres, vmod);
-    
-            vst1q_u64(&res[i], vres);
-        }
-    }
-
-    void subSIMD(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, std::vector<uint64_t> &res)
-    {
-        size_t n = a.size();
-        res.resize(n);
-        uint64x2_t mod = vdupq_n_u64(N);
-    
-        for (size_t i = 0; i < n; i += 2) {
-            uint64x2_t va = vld1q_u64(&a[i]);
-            uint64x2_t vb = vld1q_u64(&b[i]);
-    
-            uint64x2_t vres = vsubq_u64(va, vb);
-            uint64x2_t underflow = vcgtq_u64(vb, va);  // 如果 b > a，则需要补 mod
-            uint64x2_t vmod = vandq_u64(underflow, mod);
-            vres = vaddq_u64(vres, vmod);
-    
-            vst1q_u64(&res[i], vres);
+            __uint128_t prod1 = (__uint128_t)vgetq_lane_u64(lo, 1);
+            prod1 += (__uint128_t)vgetq_lane_u64(mid, 1) << 32;
+            prod1 += (__uint128_t)vgetq_lane_u64(hi, 1) << 64;
+            res[i + 1] = REDC(prod1);
         }
     }
 
@@ -316,16 +309,6 @@ public:
         uint64_t r1 = ModMul(a_raw[1], b_raw[1]);
 
         return (uint64x2_t){r0, r1};
-    }
-
-    inline uint64x2_t toMontgomerySIMD(uint64x2_t a)
-    {
-        return ModMulSIMD(a, vec_R2);
-    }
-    
-    inline uint64x2_t fromMontgomerySIMD(uint64x2_t a)
-    {
-        return ModMulSIMD(a, vdupq_n_u64(1));
     }
 public:
     uint64_t N, R, R2, N_inv_neg;
