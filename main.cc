@@ -10,6 +10,8 @@
 #include <cmath>
 #include <vector>
 #include <arm_neon.h>
+#include <pthread.h>
+#include <stdint.h>
 // 可以自行添加需要的头文件
 
 void fRead(int *a, int *b, int *n, int *p, int input_id){
@@ -76,8 +78,6 @@ void poly_multiply(int *a, int *b, int *ab, int n, int p){
     }
 }
 
-//这里我们分开尝试递归和迭代写法，先从递归开始吧（这个好写）
-
 //快速幂
 uint64_t power(int base, int exp, int mod) 
 {
@@ -92,42 +92,6 @@ uint64_t power(int base, int exp, int mod)
         exp >>= 1;
     }
     return res;
-}
-
-//不用看下面这个递归版本，这个版本还没测试过
-std::vector<int> NTT_recursive(std::vector<int> &a,int n,int p,int inv)
-{
-    if(n==1)//长度为0，直接返回
-    {
-        return a;
-    }
-    int g = 3; //原根
-    int wn = power(g, (p - 1) / n, p);
-    if (inv == -1)
-    {
-        wn = power(wn, p - 2, p); //模逆元
-    }
-    int half = n / 2;
-    std::vector<int> a_e(half);
-    std::vector<int> a_o(half);
-    for (int i = 0; i < n; i += 2)
-    {
-        a_e[i / 2] = a[i];
-        a_o[i / 2] = a[i + 1];
-    }
-    a_e = NTT_recursive(a_e, half, p, inv);
-    a_o = NTT_recursive(a_o, half, p, inv);
-    std::vector<int> result(n);
-    int w = 1;
-    for (int i = 0; i < half; ++i)
-    {
-        int u = a_e[i];
-        int v = 1LL * w * a_o[i] % p;
-        result[i] = (u + v) % p;
-        result[i + half] = (u - v + p) % p;
-        w = 1LL * w * wn % p;
-    }
-    return result;
 }
 
 class montgomery
@@ -231,28 +195,6 @@ public:
         }
     }
 
-    //粗略乘法也能过四个测试样例，挺神奇的，可能因为数据都是
-    // void ModMulSIMD(const std::vector<uint64_t> &a,const std::vector<uint64_t> &b,std::vector<uint64_t> &res)
-    // {
-    //     size_t n = a.size();
-    //     res.resize(n);
-    //     for (size_t i = 0; i < n; i += 2) 
-    //     {
-    //     //拆成32-bit低高位
-    //     uint32x2_t a_lo = {uint32_t(a[i]), uint32_t(a[i + 1])};
-    //     uint32x2_t a_hi = {uint32_t(a[i] >> 32), uint32_t(a[i + 1] >> 32)};
-    //     uint32x2_t b_lo = {uint32_t(b[i]), uint32_t(b[i + 1])};
-    //     uint32x2_t b_hi = {uint32_t(b[i] >> 32), uint32_t(b[i + 1] >> 32)};
-
-    //     uint64x2_t res_lo = vmull_u32(a_lo, b_lo); //a_lo * b_lo
-    //     uint64x2_t res_hi = vmull_u32(a_hi, b_hi); //a_hi * b_hi
-    //     uint64x2_t result = vaddq_u64(res_lo, res_hi); //简化估算，不完整乘法（适用于测试）
-
-    //     res[i] = REDC((__uint128_t)vgetq_lane_u64(result, 0));
-    //     res[i + 1] = REDC((__uint128_t)vgetq_lane_u64(result, 1));
-    //     }
-    // }
-
     //完整版乘法
     void ModMulSIMD(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, std::vector<uint64_t> &res)
     {
@@ -318,6 +260,40 @@ public:
     uint64x2_t vec_R2;
 };
 
+const int max_thread = 8;//CPU为8核
+
+struct NTTTaskArgs 
+{
+    std::vector<uint64_t>* a;
+    int n, p, len;
+    uint64_t wnR;
+    int start_block, end_block;
+    montgomery* m;
+};
+
+void* ntt_worker(void* arg) 
+{
+    NTTTaskArgs* args = (NTTTaskArgs*)arg;
+    auto& a = *args->a;
+    montgomery& m = *args->m;
+
+    for (int b = args->start_block; b < args->end_block; ++b) 
+    {
+        int i = b * args->len;
+        uint64_t w_mont = m.toMont(1);
+        for (int j = 0; j < args->len / 2; ++j) 
+        {
+            uint64_t u = a[i + j];
+            uint64_t v = m.ModMul(w_mont, a[i + j + args->len / 2]);
+            a[i + j] = (u + v) % args->p;
+            a[i + j + args->len / 2] = (u - v + args->p) % args->p;
+            w_mont = m.ModMul(w_mont, args->wnR);
+        }
+    }
+
+    return nullptr;
+}
+
 //下面是迭代的写法，据说更快（想必更快）
 //位转换置换，原来位转换置换有问题，索引交换错误
 void bit_reverse(std::vector<uint64_t> &a,int n)
@@ -337,11 +313,8 @@ void bit_reverse(std::vector<uint64_t> &a,int n)
     }
 }
 
-void NTT_iterative(std::vector<uint64_t> &a, int n, int p, int inv)
+void NTT_iterative(std::vector<uint64_t> &a, int n, int p, int inv,montgomery &m)
 {
-    uint64_t R = 1ULL << 32;
-    montgomery m(R,p);
-
     int g = 3; //原根
     bit_reverse(a, n); //位反转置换
 
@@ -352,29 +325,49 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, int p, int inv)
         {
             wn = power(wn, p - 2, p);
         }
+        uint64_t wnR= m.toMont(wn);
 
-        for(int i = 0; i < n;i+=len) 
+        int total_blocks = n / len;
+        int num_threads = std::min(max_thread, total_blocks);
+        int chunk = (total_blocks + num_threads - 1) / num_threads;
+
+        pthread_t threads[max_thread];
+        NTTTaskArgs args[max_thread];
+
+        // for(int i = 0; i < n;i+=len) 
+        // {
+        //     uint64_t w_mont = m.toMont(1);
+        //     for (int j = 0; j < len / 2;++j) 
+        //     {
+        //         uint64_t u = a[i + j];
+        //         uint64_t v = m.ModMul(w_mont, a[i + j + len/2]);
+        //         a[i + j] = (u + v) % p;
+        //         a[i + j + len / 2] = (u - v + p) % p;
+        //         w_mont = m.ModMul(w_mont, wnR);
+        //     }
+        // }
+
+        for (int t = 0; t < num_threads; ++t) 
         {
-            int w_mont = 1;
-            for (int j = 0; j < len / 2;++j) 
-            {
-                uint64_t u = a[i + j];
-                // int v = 1LL * w * a[i + j + len / 2] % p;
-                uint64_t v = m.ModMul(w_mont, a[i + j + len/2]);
-                a[i + j] = (u + v) % p;
-                a[i + j + len / 2] = (u - v + p) % p;
-                w_mont = m.ModMul(w_mont, wn);
-            }
+            int start = t * chunk;
+            int end = std::min(start + chunk, total_blocks);
+            args[t] = NTTTaskArgs{&a, n, p, len, wnR, start, end, &m};
+            pthread_create(&threads[t], nullptr, ntt_worker, &args[t]);
+        }
+
+        for (int t = 0; t < num_threads; ++t) 
+        {
+            pthread_join(threads[t], nullptr);
         }
     }
 
     if(inv == -1) 
     {
         int inv_n = power(n, p - 2, p);
+        uint64_t invR = m.toMont(inv_n);
         for (uint64_t &x : a)
         {
-            // x = 1LL * x * inv_n % p;
-            x = m.ModMul(x, inv_n);
+            x = m.ModMul(x, invR);
         }
     }
 }
@@ -543,7 +536,7 @@ int main(int argc, char *argv[])
         int len = 1;
         while(len<2*n_)
         {
-            len <<= 2;
+            len <<= 1;
         }
         std::vector<uint64_t> a_1(len, 0);
         std::vector<uint64_t> b_1(len, 0);
@@ -557,10 +550,10 @@ int main(int argc, char *argv[])
         // TODO : 将 poly_multiply 函数替换成你写的 ntt
         m.toMontgomery(a_1);
         m.toMontgomery(b_1);
-        NTT_radix4(a_1, len, p_, 1, m);
-        NTT_radix4(b_1, len, p_, 1, m);
+        NTT_iterative(a_1, len, p_, 1, m);
+        NTT_iterative(b_1, len, p_, 1, m);
         m.ModMulSIMD(a_1, b_1, c);
-        NTT_radix4(c, len, p_, -1, m);
+        NTT_iterative(c, len, p_, -1, m);
         m.fromMontgomery(c);
         auto End = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < 2 * n_ - 1; ++i)
