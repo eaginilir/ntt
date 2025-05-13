@@ -12,9 +12,10 @@
 #include <arm_neon.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <shared_mutex>
 // 可以自行添加需要的头文件
 
-void fRead(int *a, int *b, int *n, int *p, int input_id){
+void fRead(uint64_t *a, uint64_t *b, uint64_t *n, uint64_t *p, int input_id){
     // 数据输入函数
     std::string str1 = "/nttdata/";
     std::string str2 = std::to_string(input_id);
@@ -33,7 +34,7 @@ void fRead(int *a, int *b, int *n, int *p, int input_id){
     }
 }
 
-void fCheck(int *ab, int n, int input_id){
+void fCheck(uint64_t *ab, int n, int input_id){
     // 判断多项式乘法结果是否正确
     std::string str1 = "/nttdata/";
     std::string str2 = std::to_string(input_id);
@@ -44,7 +45,7 @@ void fCheck(int *ab, int n, int input_id){
     std::ifstream fin;
     fin.open(data_path, std::ios::in);
     for (int i = 0; i < n * 2 - 1; i++){
-        int x;
+        uint64_t x;
         fin>>x;
         if(x != ab[i]){
             std::cout<<"多项式乘法结果错误"<<std::endl;
@@ -55,7 +56,7 @@ void fCheck(int *ab, int n, int input_id){
     return;
 }
 
-void fWrite(int *ab, int n, int input_id){
+void fWrite(uint64_t *ab, int n, int input_id){
     // 数据输出函数, 可以用来输出最终结果, 也可用于调试时输出中间数组
     std::string str1 = "files/";
     std::string str2 = std::to_string(input_id);
@@ -70,6 +71,31 @@ void fWrite(int *ab, int n, int input_id){
     }
 }
 
+std::string to_string(__uint128_t value) {
+    if (value == 0) return "0";
+    std::string result;
+    while (value > 0) {
+        result = char('0' + value % 10) + result;
+        value /= 10;
+    }
+    return result;
+}
+
+void fWrite(__uint128_t *ab, int n, int input_id){
+    // 数据输出函数, 可以用来输出最终结果, 也可用于调试时输出中间数组
+    std::string str1 = "files/";
+    std::string str2 = std::to_string(input_id);
+    std::string strout = str1 + str2 + ".out";
+    char output_path[strout.size() + 1];
+    std::copy(strout.begin(), strout.end(), output_path);
+    output_path[strout.size()] = '\0';
+    std::ofstream fout;
+    fout.open(output_path, std::ios::out);
+    for (int i = 0; i < n * 2 - 1; i++){
+        fout<<to_string(ab[i])<<'\n';
+    }
+}
+
 void poly_multiply(int *a, int *b, int *ab, int n, int p){
     for(int i = 0; i < n; ++i){
         for(int j = 0; j < n; ++j){
@@ -79,7 +105,7 @@ void poly_multiply(int *a, int *b, int *ab, int n, int p){
 }
 
 //快速幂
-uint64_t power(int base, int exp, int mod) 
+uint64_t power(uint64_t base, uint64_t exp, uint64_t mod) 
 {
     uint64_t res = 1;
     while (exp > 0) 
@@ -313,63 +339,163 @@ void bit_reverse(std::vector<uint64_t> &a,int n)
     }
 }
 
-void NTT_iterative(std::vector<uint64_t> &a, int n, int p, int inv,montgomery &m)
+void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv,montgomery &m)
 {
     int g = 3; //原根
     bit_reverse(a, n); //位反转置换
 
     for(int len = 2; len <= n;len<<=1) 
     {
-        int wn = power(g, (p - 1) / len, p);
+        // int wn = power(g, (p - 1) / len, p);
+        uint64_t wn = power(g, (p - 1) / len, p);
         if(inv==-1)
         {
             wn = power(wn, p - 2, p);
         }
         uint64_t wnR= m.toMont(wn);
 
-        int total_blocks = n / len;
-        int num_threads = std::min(max_thread, total_blocks);
-        int chunk = (total_blocks + num_threads - 1) / num_threads;
+        // int total_blocks = n / len;
+        // int num_threads = std::min(max_thread, total_blocks);
+        // int chunk = (total_blocks + num_threads - 1) / num_threads;
 
-        pthread_t threads[max_thread];
-        NTTTaskArgs args[max_thread];
+        // pthread_t threads[max_thread];
+        // NTTTaskArgs args[max_thread];
 
-        // for(int i = 0; i < n;i+=len) 
+        for(int i = 0; i < n;i+=len) 
+        {
+            uint64_t w_mont = m.toMont(1);
+            for (int j = 0; j < len / 2;++j) 
+            {
+                uint64_t u = a[i + j];
+                uint64_t v = m.ModMul(w_mont, a[i + j + len/2]);
+                a[i + j] = (u + v) % p;
+                a[i + j + len / 2] = (u - v + p) % p;
+                w_mont = m.ModMul(w_mont, wnR);
+            }
+        }
+
+        // for (int t = 0; t < num_threads; ++t) 
         // {
-        //     uint64_t w_mont = m.toMont(1);
-        //     for (int j = 0; j < len / 2;++j) 
-        //     {
-        //         uint64_t u = a[i + j];
-        //         uint64_t v = m.ModMul(w_mont, a[i + j + len/2]);
-        //         a[i + j] = (u + v) % p;
-        //         a[i + j + len / 2] = (u - v + p) % p;
-        //         w_mont = m.ModMul(w_mont, wnR);
-        //     }
+        //     int start = t * chunk;
+        //     int end = std::min(start + chunk, total_blocks);
+        //     args[t] = NTTTaskArgs{&a, n, p, len, wnR, start, end, &m};
+        //     pthread_create(&threads[t], nullptr, ntt_worker, &args[t]);
         // }
 
-        for (int t = 0; t < num_threads; ++t) 
-        {
-            int start = t * chunk;
-            int end = std::min(start + chunk, total_blocks);
-            args[t] = NTTTaskArgs{&a, n, p, len, wnR, start, end, &m};
-            pthread_create(&threads[t], nullptr, ntt_worker, &args[t]);
-        }
-
-        for (int t = 0; t < num_threads; ++t) 
-        {
-            pthread_join(threads[t], nullptr);
-        }
+        // for (int t = 0; t < num_threads; ++t) 
+        // {
+        //     pthread_join(threads[t], nullptr);
+        // }
     }
 
     if(inv == -1) 
     {
-        int inv_n = power(n, p - 2, p);
+        // int inv_n = power(n, p - 2, p);
+        uint64_t inv_n = power(n, p - 2, p);
         uint64_t invR = m.toMont(inv_n);
         for (uint64_t &x : a)
         {
             x = m.ModMul(x, invR);
         }
     }
+}
+
+struct CRTTaskArgs
+{
+    std::vector<uint64_t> *a;
+    std::vector<uint64_t> *b;
+    std::vector<uint64_t> *result;
+    uint64_t p;
+    int len;
+    montgomery *m;
+};
+
+void* CRT_worker(void* arg) 
+{
+    CRTTaskArgs* args = (CRTTaskArgs*)arg;
+    auto& a = *args->a;
+    auto& b = *args->b;
+    auto& result = *args->result;
+    montgomery& m = *args->m;
+    int len = args->len;
+    uint64_t p = args->p;
+
+    m.toMontgomery(a);
+    m.toMontgomery(b);
+
+    NTT_iterative(a, len, p, 1, m);
+    NTT_iterative(b, len, p, 1, m);
+
+    m.ModMulSIMD(a, b, result);
+    
+    NTT_iterative(result, len, p, -1, m);
+    m.fromMontgomery(result);
+
+    if(p==7340033)
+    {
+        uint64_t check[len] = {0};
+        for (int i = 0; i < len;++i)
+        {
+            check[i] = result[i];
+        }
+        fWrite(check, len/2, 10);
+    }
+    else if(p==104857601)
+    {
+        uint64_t check[len] = {0};
+        for (int i = 0; i < len;++i)
+        {
+            check[i] = result[i];
+        }
+        fWrite(check, len/2, 11);
+    }
+    else if(p==469762049)
+    {
+        uint64_t check[len] = {0};
+        for (int i = 0; i < len;++i)
+        {
+            check[i] = result[i];
+        }
+        fWrite(check, len/2, 12);
+    }
+    else if(p==998244353)
+    {
+        uint64_t check[len] = {0};
+        for (int i = 0; i < len;++i)
+        {
+            check[i] = result[i];
+        }
+        fWrite(check, len/2, 16);
+    }
+    return nullptr;
+}
+
+__uint128_t temp[300000];
+int pos = 0;
+
+uint64_t crt_combine(const std::vector<uint64_t> &res, const std::vector<uint64_t> &mods, uint64_t target_mod) 
+{
+    //出错原因在这里，因为三模数相乘超过uint64_t范围
+    __uint128_t M = 1;
+    for (auto m : mods) 
+    {
+        M *= m;
+    }
+
+    __uint128_t result = 0;
+    for (int i = 0; i < mods.size(); ++i) 
+    {
+        __uint128_t Mi = M / mods[i];
+        __uint128_t inv = power(Mi % mods[i], mods[i] - 2, mods[i]);
+        __uint128_t t = (__uint128_t)res[i] * inv % mods[i];
+        __uint128_t term = t * Mi % M;
+
+        result = (result + term) % M;
+    }
+
+    // temp[pos++] = result;
+
+    return (uint64_t)(result % target_mod);
 }
 
 //基4的位逆序置换函数
@@ -502,7 +628,8 @@ void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv,montgomery &m)
     }
     if (inv == -1) 
     {
-        int inv_n = power(n, p - 2, p);
+        // int inv_n = power(n, p - 2, p);
+        uint64_t inv_n = power(n, p - 2, p);
         uint64_t invR = m.toMont(inv_n);
         uint64x2_t invR_vec = vdupq_n_u64(invR);
         for (size_t i = 0; i < a.size(); i += 2) 
@@ -514,25 +641,35 @@ void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv,montgomery &m)
     }
 }
 
-int a[300000],b[300000], ab[300000];
+// int a[300000], b[300000];
+uint64_t a[300000],b[300000],ab[300000];
 int main(int argc, char *argv[])
 {
     
     // 保证输入的所有模数的原根均为 3, 且模数都能表示为 a \times 4 ^ k + 1 的形式
-    // 输入模数分别为 7340033 104857601 469762049 263882790666241
+    // 输入模数分别为 7340033 104857601 469762049 1337006139375617
     // 第四个模数超过了整型表示范围, 如果实现此模数意义下的多项式乘法需要修改框架
     // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
     // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
     // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
-    int test_begin = 0;
-    int test_end = 3;
+    int test_begin = 4;
+    int test_end = 4;
     for(int i = test_begin; i <= test_end; ++i){
         long double ans = 0;
-        int n_, p_;
+        uint64_t n_, p_;
         fRead(a, b, &n_, &p_, i);
         memset(ab, 0, sizeof(ab));
         uint64_t R = 1ULL << 32;
         montgomery m(R,p_);
+        //三模数分解
+        std::vector<uint64_t> mods = {7340033, 104857601, 469762049};
+        std::vector<montgomery> montgomery_instances = {
+            montgomery(R, mods[0]),
+            montgomery(R, mods[1]),
+            montgomery(R, mods[2])
+        };
+        std::vector<CRTTaskArgs> threadData(3);
+        std::vector<pthread_t> threads(3);
         int len = 1;
         while(len<2*n_)
         {
@@ -548,14 +685,45 @@ int main(int argc, char *argv[])
         std::vector<uint64_t> c(len, 0);
         auto Start = std::chrono::high_resolution_clock::now();
         // TODO : 将 poly_multiply 函数替换成你写的 ntt
-        m.toMontgomery(a_1);
-        m.toMontgomery(b_1);
-        NTT_iterative(a_1, len, p_, 1, m);
-        NTT_iterative(b_1, len, p_, 1, m);
-        m.ModMulSIMD(a_1, b_1, c);
-        NTT_iterative(c, len, p_, -1, m);
-        m.fromMontgomery(c);
+        // m.toMontgomery(a_1);
+        // m.toMontgomery(b_1);
+        // NTT_iterative(a_1, len, p_, 1, m);
+        // NTT_iterative(b_1, len, p_, 1, m);
+        // m.ModMulSIMD(a_1, b_1, c);
+        // NTT_iterative(c, len, p_, -1, m);
+        // m.fromMontgomery(c);
+        std::vector<std::vector<uint64_t>> a_mods(3, std::vector<uint64_t>(len, 0));
+        std::vector<std::vector<uint64_t>> b_mods(3, std::vector<uint64_t>(len, 0));
+        for (int k = 0; k < 3; ++k)
+        {
+            for (int j = 0; j < n_; ++j) 
+            {
+                a_mods[k][j] = a[j];
+                b_mods[k][j] = b[j];
+            }
+            threadData[k] = CRTTaskArgs{&a_mods[k], &b_mods[k], new std::vector<uint64_t>(len, 0), mods[k], len, &montgomery_instances[k]};
+            pthread_create(&threads[k], nullptr, CRT_worker, &threadData[k]);
+        }
+
+        //等待所有线程完成
+        for (int k = 0; k < 3; ++k) 
+        {
+            pthread_join(threads[k], nullptr);
+        }
+
+        //CRT合并
+        for (int i = 0; i < len; ++i) 
+        {
+            std::vector<uint64_t> res_i = {(*threadData[0].result)[i], (*threadData[1].result)[i], (*threadData[2].result)[i]};
+            c[i] = crt_combine(res_i, mods, p_);
+        }
         auto End = std::chrono::high_resolution_clock::now();
+        fWrite(temp, n_, 15);
+        // 释放内存
+        for (int k = 0; k < 3; ++k) 
+        {
+            delete threadData[k].result;
+        }
         for (int i = 0; i < 2 * n_ - 1; ++i)
         {
             ab[i] = c[i];
