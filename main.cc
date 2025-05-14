@@ -39,11 +39,27 @@ void fCheck(uint64_t *ab, int n, int input_id){
     std::string str1 = "/nttdata/";
     std::string str2 = std::to_string(input_id);
     std::string strout = str1 + str2 + ".out";
+    // std::string logout = "files/log.out";
     char data_path[strout.size() + 1];
     std::copy(strout.begin(), strout.end(), data_path);
     data_path[strout.size()] = '\0';
     std::ifstream fin;
+    // std::ofstream fout(logout, std::ios::app);
     fin.open(data_path, std::ios::in);
+
+    // bool correct = true;
+    // for (int i = 0; i < n * 2 - 1; i++) {
+    //     uint64_t x;
+    //     fin >> x;
+    //     if (x != ab[i]) {
+    //         fout << "错误位置: " << i 
+    //              << ", 期望值: " << x 
+    //              << ", 实际值: " << ab[i] 
+    //              << std::endl;
+    //         correct = false;
+    //     }
+    // }
+
     for (int i = 0; i < n * 2 - 1; i++){
         uint64_t x;
         fin>>x;
@@ -86,6 +102,36 @@ void fWrite(__uint128_t *ab, int n, int input_id){
     std::string str1 = "files/";
     std::string str2 = std::to_string(input_id);
     std::string strout = str1 + str2 + ".out";
+    char output_path[strout.size() + 1];
+    std::copy(strout.begin(), strout.end(), output_path);
+    output_path[strout.size()] = '\0';
+    std::ofstream fout;
+    fout.open(output_path, std::ios::out);
+    for (int i = 0; i < n * 2 - 1; i++){
+        fout<<to_string(ab[i])<<'\n';
+    }
+}
+
+void fWrite(uint64_t *ab, int n, std::string path,int test_id){
+    // 数据输出函数, 可以用来输出最终结果, 也可用于调试时输出中间数组
+    std::string str1 = "files/";
+    std::string num = std::to_string(test_id);
+    std::string strout = str1 + path + num +".out";
+    char output_path[strout.size() + 1];
+    std::copy(strout.begin(), strout.end(), output_path);
+    output_path[strout.size()] = '\0';
+    std::ofstream fout;
+    fout.open(output_path, std::ios::out);
+    for (int i = 0; i < n * 2 - 1; i++){
+        fout<<ab[i]<<'\n';
+    }
+}
+
+void fWrite(__uint128_t *ab, int n, std::string path,int test_id){
+    // 数据输出函数, 可以用来输出最终结果, 也可用于调试时输出中间数组
+    std::string str1 = "files/";
+    std::string num = std::to_string(test_id);
+    std::string strout = str1 + path + num + ".out";
     char output_path[strout.size() + 1];
     std::copy(strout.begin(), strout.end(), output_path);
     output_path[strout.size()] = '\0';
@@ -431,47 +477,8 @@ void* CRT_worker(void* arg)
     NTT_iterative(result, len, p, -1, m);
     m.fromMontgomery(result);
 
-    if(p==7340033)
-    {
-        uint64_t check[len] = {0};
-        for (int i = 0; i < len;++i)
-        {
-            check[i] = result[i];
-        }
-        fWrite(check, len/2, 10);
-    }
-    else if(p==104857601)
-    {
-        uint64_t check[len] = {0};
-        for (int i = 0; i < len;++i)
-        {
-            check[i] = result[i];
-        }
-        fWrite(check, len/2, 11);
-    }
-    else if(p==469762049)
-    {
-        uint64_t check[len] = {0};
-        for (int i = 0; i < len;++i)
-        {
-            check[i] = result[i];
-        }
-        fWrite(check, len/2, 12);
-    }
-    else if(p==998244353)
-    {
-        uint64_t check[len] = {0};
-        for (int i = 0; i < len;++i)
-        {
-            check[i] = result[i];
-        }
-        fWrite(check, len/2, 16);
-    }
     return nullptr;
 }
-
-__uint128_t temp[300000];
-int pos = 0;
 
 uint64_t crt_combine(const std::vector<uint64_t> &res, const std::vector<uint64_t> &mods, uint64_t target_mod) 
 {
@@ -492,8 +499,6 @@ uint64_t crt_combine(const std::vector<uint64_t> &res, const std::vector<uint64_
 
         result = (result + term) % M;
     }
-
-    // temp[pos++] = result;
 
     return (uint64_t)(result % target_mod);
 }
@@ -661,15 +666,16 @@ int main(int argc, char *argv[])
         memset(ab, 0, sizeof(ab));
         uint64_t R = 1ULL << 32;
         montgomery m(R,p_);
-        //三模数分解
-        std::vector<uint64_t> mods = {7340033, 104857601, 469762049};
+        //多模数分解
+        std::vector<uint64_t> mods = {1004535809, 104857601, 469762049, 998244353};
         std::vector<montgomery> montgomery_instances = {
             montgomery(R, mods[0]),
             montgomery(R, mods[1]),
-            montgomery(R, mods[2])
+            montgomery(R, mods[2]),
+            montgomery(R, mods[3])
         };
-        std::vector<CRTTaskArgs> threadData(3);
-        std::vector<pthread_t> threads(3);
+        std::vector<CRTTaskArgs> threadData(4);
+        std::vector<pthread_t> threads(4);
         int len = 1;
         while(len<2*n_)
         {
@@ -692,9 +698,9 @@ int main(int argc, char *argv[])
         // m.ModMulSIMD(a_1, b_1, c);
         // NTT_iterative(c, len, p_, -1, m);
         // m.fromMontgomery(c);
-        std::vector<std::vector<uint64_t>> a_mods(3, std::vector<uint64_t>(len, 0));
-        std::vector<std::vector<uint64_t>> b_mods(3, std::vector<uint64_t>(len, 0));
-        for (int k = 0; k < 3; ++k)
+        std::vector<std::vector<uint64_t>> a_mods(4, std::vector<uint64_t>(len, 0));
+        std::vector<std::vector<uint64_t>> b_mods(4, std::vector<uint64_t>(len, 0));
+        for (int k = 0; k < 4; ++k)
         {
             for (int j = 0; j < n_; ++j) 
             {
@@ -706,7 +712,7 @@ int main(int argc, char *argv[])
         }
 
         //等待所有线程完成
-        for (int k = 0; k < 3; ++k) 
+        for (int k = 0; k < 4; ++k) 
         {
             pthread_join(threads[k], nullptr);
         }
@@ -714,13 +720,12 @@ int main(int argc, char *argv[])
         //CRT合并
         for (int i = 0; i < len; ++i) 
         {
-            std::vector<uint64_t> res_i = {(*threadData[0].result)[i], (*threadData[1].result)[i], (*threadData[2].result)[i]};
+            std::vector<uint64_t> res_i = {(*threadData[0].result)[i], (*threadData[1].result)[i], (*threadData[2].result)[i], (*threadData[3].result)[i]};
             c[i] = crt_combine(res_i, mods, p_);
         }
         auto End = std::chrono::high_resolution_clock::now();
-        fWrite(temp, n_, 15);
-        // 释放内存
-        for (int k = 0; k < 3; ++k) 
+        //释放内存
+        for (int k = 0; k < 4; ++k) 
         {
             delete threadData[k].result;
         }
