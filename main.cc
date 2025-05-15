@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <shared_mutex>
+#include <cassert>
 // 可以自行添加需要的头文件
 
 void fRead(uint64_t *a, uint64_t *b, uint64_t *n, uint64_t *p, int input_id){
@@ -39,24 +40,27 @@ void fCheck(uint64_t *ab, int n, int input_id){
     std::string str1 = "/nttdata/";
     std::string str2 = std::to_string(input_id);
     std::string strout = str1 + str2 + ".out";
-    // std::string logout = "files/log.out";
+    std::string logout = "files/log.out";
     char data_path[strout.size() + 1];
     std::copy(strout.begin(), strout.end(), data_path);
     data_path[strout.size()] = '\0';
     std::ifstream fin;
-    // std::ofstream fout(logout, std::ios::app);
+    std::ofstream fout(logout, std::ios::app);
     fin.open(data_path, std::ios::in);
 
-    // bool correct = true;
-    // for (int i = 0; i < n * 2 - 1; i++) {
-    //     uint64_t x;
-    //     fin >> x;
-    //     if (x != ab[i]) {
-    //         fout << "错误位置: " << i 
-    //              << ", 期望值: " << x 
-    //              << ", 实际值: " << ab[i] 
-    //              << std::endl;
-    //         correct = false;
+    // if(input_id==4)
+    // {
+    //     bool correct = true;
+    //     for (int i = 0; i < n * 2 - 1; i++) {
+    //         uint64_t x;
+    //         fin >> x;
+    //         if (x != ab[i]) {
+    //             fout << "错误位置: " << i 
+    //                 << ", 期望值: " << x 
+    //                 << ", 实际值: " << ab[i] 
+    //                 << std::endl;
+    //             correct = false;
+    //         }
     //     }
     // }
 
@@ -65,6 +69,9 @@ void fCheck(uint64_t *ab, int n, int input_id){
         fin>>x;
         if(x != ab[i]){
             std::cout<<"多项式乘法结果错误"<<std::endl;
+            // std::cout << i << std::endl;
+            // std::cout << x << std::endl;
+            // std::cout << ab[i] << std::endl;
             return;
         }
     }
@@ -333,11 +340,14 @@ public:
 };
 
 const int max_thread = 8;//CPU为8核
+//但是目前我打算这样分，如果是4个模数的话，先分4个线程，然后单独一个线程再分两个线程，这样正好8个
 
 struct NTTTaskArgs 
 {
     std::vector<uint64_t>* a;
-    int n, p, len;
+    int n;
+    uint64_t p;
+    int len;
     uint64_t wnR;
     int start_block, end_block;
     montgomery* m;
@@ -392,7 +402,6 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv,montgome
 
     for(int len = 2; len <= n;len<<=1) 
     {
-        // int wn = power(g, (p - 1) / len, p);
         uint64_t wn = power(g, (p - 1) / len, p);
         if(inv==-1)
         {
@@ -436,7 +445,6 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv,montgome
 
     if(inv == -1) 
     {
-        // int inv_n = power(n, p - 2, p);
         uint64_t inv_n = power(n, p - 2, p);
         uint64_t invR = m.toMont(inv_n);
         for (uint64_t &x : a)
@@ -472,13 +480,55 @@ void* CRT_worker(void* arg)
     NTT_iterative(a, len, p, 1, m);
     NTT_iterative(b, len, p, 1, m);
 
-    m.ModMulSIMD(a, b, result);
-    
+    // m.ModMulSIMD(a, b, result);
+    for (int i = 0; i < len; ++i) 
+    {
+        result[i] = m.ModMul(a[i], b[i]);
+    }
     NTT_iterative(result, len, p, -1, m);
     m.fromMontgomery(result);
 
+    // if(p==1004535809)
+    // {
+    //     uint64_t check[len];
+    //     for(int i = 0; i < len; ++i)
+    //     {
+    //         check[i] = result[i];
+    //     }
+    //     fWrite(check, len / 2, "check_mods1_", 4);
+    // }
+    // if(p==104857601)
+    // {
+    //     uint64_t check[len];
+    //     for(int i = 0; i < len; ++i)
+    //     {
+    //         check[i] = result[i];
+    //     }
+    //     fWrite(check, len / 2, "check_mods2_", 4);
+    // }
+    // if(p==469762049)
+    // {
+    //     uint64_t check[len];
+    //     for(int i = 0; i < len; ++i)
+    //     {
+    //         check[i] = result[i];
+    //     }
+    //     fWrite(check, len / 2, "check_mods3_", 4);
+    // }
+    // if(p==998244353)
+    // {
+    //     uint64_t check[len];
+    //     for(int i = 0; i < len; ++i)
+    //     {
+    //         check[i] = result[i];
+    //     }
+    //     fWrite(check, len / 2, "check_mods4_", 4);
+    // }
     return nullptr;
 }
+
+// uint64_t temp[300000];
+// int pos = 0;
 
 uint64_t crt_combine(const std::vector<uint64_t> &res, const std::vector<uint64_t> &mods, uint64_t target_mod) 
 {
@@ -499,6 +549,8 @@ uint64_t crt_combine(const std::vector<uint64_t> &res, const std::vector<uint64_
 
         result = (result + term) % M;
     }
+
+    // temp[pos++]=result;
 
     return (uint64_t)(result % target_mod);
 }
@@ -657,7 +709,7 @@ int main(int argc, char *argv[])
     // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
     // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
     // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
-    int test_begin = 4;
+    int test_begin = 0;
     int test_end = 4;
     for(int i = test_begin; i <= test_end; ++i){
         long double ans = 0;
@@ -665,9 +717,12 @@ int main(int argc, char *argv[])
         fRead(a, b, &n_, &p_, i);
         memset(ab, 0, sizeof(ab));
         uint64_t R = 1ULL << 32;
-        montgomery m(R,p_);
+        // uint64_t R = 1ULL << 60;
+        montgomery m(R, p_);
         //多模数分解
-        std::vector<uint64_t> mods = {1004535809, 104857601, 469762049, 998244353};
+        //基本能确定是四个模数的问题了，这四个模数还是太小了
+        std::vector<uint64_t> mods = {1004535809, 1224736769, 469762049, 998244353};
+        // std::vector<uint64_t> mods = {2013265921, 1811939329, 3221225473, 1004535809};
         std::vector<montgomery> montgomery_instances = {
             montgomery(R, mods[0]),
             montgomery(R, mods[1]),
@@ -724,7 +779,7 @@ int main(int argc, char *argv[])
             c[i] = crt_combine(res_i, mods, p_);
         }
         auto End = std::chrono::high_resolution_clock::now();
-        //释放内存
+        // 释放内存
         for (int k = 0; k < 4; ++k) 
         {
             delete threadData[k].result;
@@ -733,6 +788,7 @@ int main(int argc, char *argv[])
         {
             ab[i] = c[i];
         }
+        // fWrite(ab, len / 2, "true_result_mods4_", i);
         std::chrono::duration<double,std::ratio<1,1000>>elapsed = End - Start;
         ans += elapsed.count();
         fCheck(ab, n_, i);
