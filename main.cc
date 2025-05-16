@@ -409,38 +409,38 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv,montgome
         }
         uint64_t wnR= m.toMont(wn);
 
-        // int total_blocks = n / len;
-        // int num_threads = std::min(max_thread, total_blocks);
-        // int chunk = (total_blocks + num_threads - 1) / num_threads;
+        int total_blocks = n / len;
+        int num_threads = std::min(max_thread, total_blocks);
+        int chunk = (total_blocks + num_threads - 1) / num_threads;
 
-        // pthread_t threads[max_thread];
-        // NTTTaskArgs args[max_thread];
+        pthread_t threads[max_thread];
+        NTTTaskArgs args[max_thread];
 
-        for(int i = 0; i < n;i+=len) 
+        // for(int i = 0; i < n;i+=len) 
+        // {
+        //     uint64_t w_mont = m.toMont(1);
+        //     for (int j = 0; j < len / 2;++j) 
+        //     {
+        //         uint64_t u = a[i + j];
+        //         uint64_t v = m.ModMul(w_mont, a[i + j + len/2]);
+        //         a[i + j] = (u + v) % p;
+        //         a[i + j + len / 2] = (u - v + p) % p;
+        //         w_mont = m.ModMul(w_mont, wnR);
+        //     }
+        // }
+
+        for (int t = 0; t < num_threads; ++t) 
         {
-            uint64_t w_mont = m.toMont(1);
-            for (int j = 0; j < len / 2;++j) 
-            {
-                uint64_t u = a[i + j];
-                uint64_t v = m.ModMul(w_mont, a[i + j + len/2]);
-                a[i + j] = (u + v) % p;
-                a[i + j + len / 2] = (u - v + p) % p;
-                w_mont = m.ModMul(w_mont, wnR);
-            }
+            int start = t * chunk;
+            int end = std::min(start + chunk, total_blocks);
+            args[t] = NTTTaskArgs{&a, n, p, len, wnR, start, end, &m};
+            pthread_create(&threads[t], nullptr, ntt_worker, &args[t]);
         }
 
-        // for (int t = 0; t < num_threads; ++t) 
-        // {
-        //     int start = t * chunk;
-        //     int end = std::min(start + chunk, total_blocks);
-        //     args[t] = NTTTaskArgs{&a, n, p, len, wnR, start, end, &m};
-        //     pthread_create(&threads[t], nullptr, ntt_worker, &args[t]);
-        // }
-
-        // for (int t = 0; t < num_threads; ++t) 
-        // {
-        //     pthread_join(threads[t], nullptr);
-        // }
+        for (int t = 0; t < num_threads; ++t) 
+        {
+            pthread_join(threads[t], nullptr);
+        }
     }
 
     if(inv == -1) 
@@ -480,7 +480,6 @@ void* CRT_worker(void* arg)
     NTT_iterative(a, len, p, 1, m);
     NTT_iterative(b, len, p, 1, m);
 
-    // m.ModMulSIMD(a, b, result);
     for (int i = 0; i < len; ++i) 
     {
         result[i] = m.ModMul(a[i], b[i]);
@@ -553,6 +552,68 @@ uint64_t crt_combine(const std::vector<uint64_t> &res, const std::vector<uint64_
     // temp[pos++]=result;
 
     return (uint64_t)(result % target_mod);
+}
+
+struct CRTCombineArgs 
+{
+    std::vector<uint64_t>* result;
+    const std::vector<std::vector<uint64_t>>* res_mods;
+    const std::vector<uint64_t>* mods;
+    uint64_t target_mod;
+    int l, r;
+};
+
+void* CRT_combine_worker(void* args) 
+{
+    CRTCombineArgs* data = (CRTCombineArgs*)args;
+    int l = data->l, r = data->r;
+    int mod_count = data->mods->size();
+    const auto& mods = *(data->mods);
+    const auto& res_mods = *(data->res_mods);
+    auto& result = *(data->result);
+
+    __uint128_t M = 1;
+    for (auto m : mods) M *= m;
+
+    for (int i = l; i < r; ++i) 
+    {
+        __uint128_t res = 0;
+        for (int k = 0; k < mod_count; ++k) 
+        {
+            __uint128_t Mi = M / mods[k];
+            __uint128_t inv = power(Mi % mods[k], mods[k] - 2, mods[k]);
+            __uint128_t t = (__uint128_t)res_mods[k][i] * inv % mods[k];
+            __uint128_t term = t * Mi % M;
+            res = (res + term) % M;
+        }
+        result[i] = (uint64_t)(res % data->target_mod);
+    }
+    return nullptr;
+}
+
+struct ModMulTaskArgs 
+{
+    const std::vector<uint64_t> *a;
+    const std::vector<uint64_t> *b;
+    std::vector<uint64_t> *c;
+    int start;
+    int end;
+    montgomery *m;
+};
+
+void *ModMul_worker(void *args) 
+{
+    ModMulTaskArgs *data = (ModMulTaskArgs*)args;
+    const auto &a = *(data->a);
+    const auto &b = *(data->b);
+    auto &c = *(data->c);
+    montgomery *m = data->m;
+
+    for (int i = data->start; i < data->end; ++i) 
+    {
+        c[i] = m->ModMul(a[i], b[i]);
+    }
+    return nullptr;
 }
 
 //基4的位逆序置换函数
@@ -746,37 +807,75 @@ int main(int argc, char *argv[])
         std::vector<uint64_t> c(len, 0);
         auto Start = std::chrono::high_resolution_clock::now();
         // TODO : 将 poly_multiply 函数替换成你写的 ntt
-        // m.toMontgomery(a_1);
-        // m.toMontgomery(b_1);
-        // NTT_iterative(a_1, len, p_, 1, m);
-        // NTT_iterative(b_1, len, p_, 1, m);
-        // m.ModMulSIMD(a_1, b_1, c);
-        // NTT_iterative(c, len, p_, -1, m);
-        // m.fromMontgomery(c);
-        std::vector<std::vector<uint64_t>> a_mods(4, std::vector<uint64_t>(len, 0));
-        std::vector<std::vector<uint64_t>> b_mods(4, std::vector<uint64_t>(len, 0));
-        for (int k = 0; k < 4; ++k)
+        //小模数直接用朴素，等大模数再用CRT多线程
+        if(p_<(1ULL<<50))
         {
-            for (int j = 0; j < n_; ++j) 
+            m.toMontgomery(a_1);
+            m.toMontgomery(b_1);
+            NTT_iterative(a_1, len, p_, 1, m);
+            NTT_iterative(b_1, len, p_, 1, m);
+            // m.ModMulSIMD(a_1, b_1, c);
+            for (int i = 0; i < len; ++i) 
             {
-                a_mods[k][j] = a[j];
-                b_mods[k][j] = b[j];
+                c[i] = m.ModMul(a_1[i], b_1[i]);
             }
-            threadData[k] = CRTTaskArgs{&a_mods[k], &b_mods[k], new std::vector<uint64_t>(len, 0), mods[k], len, &montgomery_instances[k]};
-            pthread_create(&threads[k], nullptr, CRT_worker, &threadData[k]);
+            NTT_iterative(c, len, p_, -1, m);
+            m.fromMontgomery(c);
         }
-
-        //等待所有线程完成
-        for (int k = 0; k < 4; ++k) 
+        else
         {
-            pthread_join(threads[k], nullptr);
-        }
+            std::vector<std::vector<uint64_t>> a_mods(4, std::vector<uint64_t>(len, 0));
+            std::vector<std::vector<uint64_t>> b_mods(4, std::vector<uint64_t>(len, 0));
+            for (int k = 0; k < 4; ++k)
+            {
+                for (int j = 0; j < n_; ++j) 
+                {
+                    a_mods[k][j] = a[j];
+                    b_mods[k][j] = b[j];
+                }
+                threadData[k] = CRTTaskArgs{&a_mods[k], &b_mods[k], new std::vector<uint64_t>(len, 0), mods[k], len, &montgomery_instances[k]};
+                pthread_create(&threads[k], nullptr, CRT_worker, &threadData[k]);
+            }
 
-        //CRT合并
-        for (int i = 0; i < len; ++i) 
-        {
-            std::vector<uint64_t> res_i = {(*threadData[0].result)[i], (*threadData[1].result)[i], (*threadData[2].result)[i], (*threadData[3].result)[i]};
-            c[i] = crt_combine(res_i, mods, p_);
+            //等待所有线程完成
+            for (int k = 0; k < 4; ++k) 
+            {
+                pthread_join(threads[k], nullptr);
+            }
+
+            //CRT合并
+            // for (int i = 0; i < len; ++i) 
+            // {
+            //     std::vector<uint64_t> res_i = {(*threadData[0].result)[i], (*threadData[1].result)[i], (*threadData[2].result)[i], (*threadData[3].result)[i]};
+            //     c[i] = crt_combine(res_i, mods, p_);
+            // }
+
+            int thread_count = 8;
+            std::vector<pthread_t> crt_threads(thread_count);
+            std::vector<CRTCombineArgs> crt_thread_data(thread_count);
+
+            std::vector<std::vector<uint64_t>> res_mods = 
+            {
+                *threadData[0].result,
+                *threadData[1].result,
+                *threadData[2].result,
+                *threadData[3].result
+            };
+
+            int block_size = (len + thread_count - 1) / thread_count;
+            for (int t = 0; t < thread_count; ++t) 
+            {
+                int l = t * block_size;
+                int r = std::min((t + 1) * block_size, len);
+                crt_thread_data[t] = CRTCombineArgs{&c, &res_mods, &mods, p_, l, r};
+                pthread_create(&crt_threads[t], nullptr, CRT_combine_worker, &crt_thread_data[t]);
+            }
+
+            // 等待所有线程完成
+            for (int t = 0; t < thread_count; ++t) 
+            {
+                pthread_join(crt_threads[t], nullptr);
+            }
         }
         auto End = std::chrono::high_resolution_clock::now();
         // 释放内存
