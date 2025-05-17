@@ -14,6 +14,8 @@
 #include <stdint.h>
 #include <shared_mutex>
 #include <cassert>
+
+
 // 可以自行添加需要的头文件
 
 void fRead(uint64_t *a, uint64_t *b, uint64_t *n, uint64_t *p, int input_id){
@@ -340,7 +342,6 @@ public:
 };
 
 const int max_thread = 8;//CPU为8核
-//但是目前我打算这样分，如果是4个模数的话，先分4个线程，然后单独一个线程再分两个线程，这样正好8个
 
 struct NTTTaskArgs 
 {
@@ -526,32 +527,30 @@ void* CRT_worker(void* arg)
     return nullptr;
 }
 
-// uint64_t temp[300000];
-// int pos = 0;
-
-uint64_t crt_combine(const std::vector<uint64_t> &res, const std::vector<uint64_t> &mods, uint64_t target_mod) 
+struct CRTPrecomputed 
 {
-    //出错原因在这里，因为三模数相乘超过uint64_t范围
-    __uint128_t M = 1;
-    for (auto m : mods) 
+    std::vector<__uint128_t> Mi;
+    std::vector<uint64_t> inv;
+    __uint128_t M;
+};
+
+CRTPrecomputed crt_precompute(const std::vector<uint64_t>& mods) 
+{
+    CRTPrecomputed pre;
+    pre.M = 1;
+    for (uint64_t m : mods) 
     {
-        M *= m;
+        pre.M *= m;
     }
-
-    __uint128_t result = 0;
-    for (int i = 0; i < mods.size(); ++i) 
+    int k = mods.size();
+    pre.Mi.resize(k);
+    pre.inv.resize(k);
+    for (int i = 0; i < k; ++i) 
     {
-        __uint128_t Mi = M / mods[i];
-        __uint128_t inv = power(Mi % mods[i], mods[i] - 2, mods[i]);
-        __uint128_t t = (__uint128_t)res[i] * inv % mods[i];
-        __uint128_t term = t * Mi % M;
-
-        result = (result + term) % M;
+        pre.Mi[i] = pre.M / mods[i];
+        pre.inv[i] = power(pre.Mi[i] % mods[i], mods[i] - 2, mods[i]);
     }
-
-    // temp[pos++]=result;
-
-    return (uint64_t)(result % target_mod);
+    return pre;
 }
 
 struct CRTCombineArgs 
@@ -559,6 +558,7 @@ struct CRTCombineArgs
     std::vector<uint64_t>* result;
     const std::vector<std::vector<uint64_t>>* res_mods;
     const std::vector<uint64_t>* mods;
+    const CRTPrecomputed* pre;
     uint64_t target_mod;
     int l, r;
 };
@@ -567,24 +567,20 @@ void* CRT_combine_worker(void* args)
 {
     CRTCombineArgs* data = (CRTCombineArgs*)args;
     int l = data->l, r = data->r;
-    int mod_count = data->mods->size();
-    const auto& mods = *(data->mods);
     const auto& res_mods = *(data->res_mods);
+    const auto& mods = *(data->mods);
     auto& result = *(data->result);
-
-    __uint128_t M = 1;
-    for (auto m : mods) M *= m;
+    const auto& pre = *(data->pre);
+    int mod_count = mods.size();
 
     for (int i = l; i < r; ++i) 
     {
         __uint128_t res = 0;
         for (int k = 0; k < mod_count; ++k) 
         {
-            __uint128_t Mi = M / mods[k];
-            __uint128_t inv = power(Mi % mods[k], mods[k] - 2, mods[k]);
-            __uint128_t t = (__uint128_t)res_mods[k][i] * inv % mods[k];
-            __uint128_t term = t * Mi % M;
-            res = (res + term) % M;
+            uint64_t t = res_mods[k][i] * pre.inv[k] % mods[k];
+            __uint128_t term = t * pre.Mi[k] % pre.M;
+            res = (res + term) % pre.M;
         }
         result[i] = (uint64_t)(res % data->target_mod);
     }
@@ -777,13 +773,14 @@ int main(int argc, char *argv[])
         uint64_t n_, p_;
         fRead(a, b, &n_, &p_, i);
         memset(ab, 0, sizeof(ab));
-        uint64_t R = 1ULL << 32;
-        // uint64_t R = 1ULL << 60;
+        // uint64_t R = 1ULL << 32;
+        //换大数有利于减少REDC的次数
+        uint64_t R = 1ULL << 60;
         montgomery m(R, p_);
         //多模数分解
         //基本能确定是四个模数的问题了，这四个模数还是太小了
         std::vector<uint64_t> mods = {1004535809, 1224736769, 469762049, 998244353};
-        // std::vector<uint64_t> mods = {2013265921, 1811939329, 3221225473, 1004535809};
+        CRTPrecomputed pre = crt_precompute(mods);
         std::vector<montgomery> montgomery_instances = {
             montgomery(R, mods[0]),
             montgomery(R, mods[1]),
@@ -844,12 +841,6 @@ int main(int argc, char *argv[])
             }
 
             //CRT合并
-            // for (int i = 0; i < len; ++i) 
-            // {
-            //     std::vector<uint64_t> res_i = {(*threadData[0].result)[i], (*threadData[1].result)[i], (*threadData[2].result)[i], (*threadData[3].result)[i]};
-            //     c[i] = crt_combine(res_i, mods, p_);
-            // }
-
             int thread_count = 8;
             std::vector<pthread_t> crt_threads(thread_count);
             std::vector<CRTCombineArgs> crt_thread_data(thread_count);
@@ -867,7 +858,7 @@ int main(int argc, char *argv[])
             {
                 int l = t * block_size;
                 int r = std::min((t + 1) * block_size, len);
-                crt_thread_data[t] = CRTCombineArgs{&c, &res_mods, &mods, p_, l, r};
+                crt_thread_data[t] = CRTCombineArgs{&c, &res_mods, &mods, &pre, p_, l, r};
                 pthread_create(&crt_threads[t], nullptr, CRT_combine_worker, &crt_thread_data[t]);
             }
 
