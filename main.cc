@@ -14,7 +14,12 @@
 #include <stdint.h>
 #include <shared_mutex>
 #include <cassert>
-
+#include <thread>
+#include <queue>
+#include <functional>
+#include <future>
+#include <atomic>
+#include <condition_variable>
 
 // 可以自行添加需要的头文件
 
@@ -355,7 +360,163 @@ public:
     uint64x2_t vec_R2;
 };
 
-const int max_thread = 8;//CPU为8核
+// 线程池实现
+class ThreadPool 
+{
+public:
+    ThreadPool(size_t numThreads) : stop(false), activeThreads(0) 
+    {
+        for (size_t i = 0; i < numThreads; ++i) 
+        {
+            workers.emplace_back([this] 
+                {
+                while (true) 
+                {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+                        condition.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) 
+                        {
+                            return;
+                        }
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                        activeThreads++; // Increment active thread count
+                    }
+                    
+                    task(); // Execute the task
+                    
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+                        activeThreads--; // Decrement active thread count
+                        lock.unlock();
+                        if (tasks.empty() && activeThreads == 0)
+                        {
+                            completionCondition.notify_all(); // Notify when all tasks are done
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) 
+    {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            if (stop) 
+            {
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+            }
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    // Improved waitForAll that ensures all tasks are completed
+    void waitForAll() 
+    {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        while (true) 
+        {
+            if (tasks.empty() && activeThreads == 0) break;
+
+            // 立即抢占执行
+            if (!tasks.empty()) 
+            {
+                auto task = std::move(tasks.front());
+                tasks.pop();
+                activeThreads++;
+                lock.unlock();
+
+                task();  // 直接执行，避免死锁
+
+                lock.lock();
+                activeThreads--;
+                if (tasks.empty() && activeThreads == 0) 
+                {
+                    completionCondition.notify_all();
+                }
+            } 
+            else 
+            {
+                completionCondition.wait(lock);
+            }
+        }
+    }
+
+    ~ThreadPool() 
+    {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread &worker : workers) 
+        {
+            worker.join();
+        }
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    std::condition_variable completionCondition; // New condition variable for task completion
+    bool stop;
+    std::atomic<int> activeThreads; // Track number of active threads
+};
+
+//定义固定大小的线程池，与CPU核心数相匹配
+const int MAX_THREADS = 8; // CPU为8核
+ThreadPool* global_thread_pool = nullptr;
+
+//初始化全局线程池
+void init_thread_pool() 
+{
+    if (global_thread_pool == nullptr) 
+    {
+        global_thread_pool = new ThreadPool(MAX_THREADS);
+    }
+}
+
+//清理全局线程池
+void cleanup_thread_pool() 
+{
+    if (global_thread_pool != nullptr) 
+    {
+        delete global_thread_pool;
+        global_thread_pool = nullptr;
+    }
+}
+
+struct ModMulTaskArgs 
+{
+    const std::vector<uint64_t> *a;
+    const std::vector<uint64_t> *b;
+    std::vector<uint64_t> *c;
+    int start;
+    int end;
+    montgomery *m;
+};
+
+void *ModMul_worker(void *args) 
+{
+    ModMulTaskArgs *data = (ModMulTaskArgs*)args;
+    const auto &a = *(data->a);
+    const auto &b = *(data->b);
+    auto &c = *(data->c);
+    montgomery *m = data->m;
+
+    for (int i = data->start; i < data->end; ++i) 
+    {
+        c[i] = m->ModMul(a[i], b[i]);
+    }
+    return nullptr;
+}
 
 struct NTTTaskArgs 
 {
@@ -368,9 +529,8 @@ struct NTTTaskArgs
     montgomery* m;
 };
 
-void* ntt_worker(void* arg) 
+void ntt_worker(NTTTaskArgs* args) 
 {
-    NTTTaskArgs* args = (NTTTaskArgs*)arg;
     auto& a = *args->a;
     montgomery& m = *args->m;
     uint64_t p = args->p;
@@ -378,23 +538,27 @@ void* ntt_worker(void* arg)
     uint64_t wnR = args->wnR;
     int start_block = args->start_block, end_block = args->end_block;
 
-    for (int b = start_block; b < end_block; ++b) 
+    std::vector<uint64_t> w_table(len / 2);
+    uint64_t w_mont = m.toMont(1);
+    for (int j = 0; j < len / 2; ++j) 
     {
-        int i = b * len;
-        uint64_t w_mont = m.toMont(1);
-        for (int j = 0; j < len / 2; ++j) 
-        {
-            uint64_t u = a[i + j];
-            uint64_t v = m.ModMul(w_mont, a[i + j + len / 2]);
-            a[i + j] = (u + v) % p;
-            a[i + j + args->len / 2] = (u - v + args->p) % p;
-            // a[i + j] = m.montgomery_add(u, v, p);
-            // a[i + j + len / 2] = m.montgomery_sub(u, v, p);
-            w_mont = m.ModMul(w_mont, wnR);
-        }
+        w_table[j] = w_mont;
+        w_mont = m.ModMul(w_mont, wnR);
     }
 
-    return nullptr;
+    for (int b = start_block; b < end_block; ++b)
+    {
+        int i = b * len;
+        uint64_t* A = &a[i];
+        for (int jj = 0; jj < len / 2; ++jj) 
+        {
+            uint64_t w = w_table[jj];
+            uint64_t u = A[jj];
+            uint64_t v = m.ModMul(w, A[jj + len / 2]);
+            A[jj] = m.montgomery_add(u, v, p);
+            A[jj + len / 2] = m.montgomery_sub(u, v, p);
+        }
+    }
 }
 
 //下面是迭代的写法，据说更快（想必更快）
@@ -416,62 +580,73 @@ void bit_reverse(std::vector<uint64_t> &a,int n)
     }
 }
 
-void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv,montgomery &m)
+void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv, montgomery &m) 
 {
-    int g = 3; //原根
-    bit_reverse(a, n); //位反转置换
+    int g = 3; // 原根
+    bit_reverse(a, n); // 位反转置换
 
-    for(int len = 2; len <= n;len<<=1) 
+    // 确保线程池已初始化
+    // init_thread_pool();
+
+    for(int len = 2; len <= n; len<<=1) 
     {
         uint64_t wn = power(g, (p - 1) / len, p);
-        if(inv==-1)
+        if(inv == -1) 
         {
             wn = power(wn, p - 2, p);
         }
-        uint64_t wnR= m.toMont(wn);
+        uint64_t wnR = m.toMont(wn);
 
         int total_blocks = n / len;
-        int num_threads = std::min(max_thread, total_blocks);
+        int num_threads = std::min(MAX_THREADS, total_blocks);
         int chunk = (total_blocks + num_threads - 1) / num_threads;
 
-        pthread_t threads[max_thread];
-        NTTTaskArgs args[max_thread];
-
-        // for(int i = 0; i < n;i+=len) 
-        // {
-        //     uint64_t w_mont = m.toMont(1);
-        //     for (int j = 0; j < len / 2;++j) 
-        //     {
-        //         uint64_t u = a[i + j];
-        //         uint64_t v = m.ModMul(w_mont, a[i + j + len/2]);
-        //         a[i + j] = (u + v) % p;
-        //         a[i + j + len / 2] = (u - v + p) % p;
-        //         w_mont = m.ModMul(w_mont, wnR);
-        //     }
-        // }
-
+        std::vector<NTTTaskArgs> args(num_threads);
+        
+        // 使用线程池分发任务
         for (int t = 0; t < num_threads; ++t) 
         {
             int start = t * chunk;
             int end = std::min(start + chunk, total_blocks);
             args[t] = NTTTaskArgs{&a, n, p, len, wnR, start, end, &m};
-            pthread_create(&threads[t], nullptr, ntt_worker, &args[t]);
+            
+            global_thread_pool->enqueue([t, &args]() 
+            {
+                ntt_worker(&args[t]);
+            });
         }
-
-        for (int t = 0; t < num_threads; ++t) 
-        {
-            pthread_join(threads[t], nullptr);
-        }
+        
+        // 等待所有NTT任务完成
+        global_thread_pool->waitForAll();
     }
 
     if(inv == -1) 
     {
         uint64_t inv_n = power(n, p - 2, p);
         uint64_t invR = m.toMont(inv_n);
-        for (uint64_t &x : a)
+        
+        // 并行处理除法
+        int num_threads = std::min(MAX_THREADS, n);
+        int chunk = (n + num_threads - 1) / num_threads;
+        
+        std::vector<std::pair<int, int>> ranges(num_threads);
+        for (int t = 0; t < num_threads; ++t) 
         {
-            x = m.ModMul(x, invR);
+            int start = t * chunk;
+            int end = std::min(start + chunk, n);
+            ranges[t] = {start, end};
+            
+            global_thread_pool->enqueue([&a, &m, invR, start, end]() 
+            {
+                for (int i = start; i < end; ++i) 
+                {
+                    a[i] = m.ModMul(a[i], invR);
+                }
+            });
         }
+        
+        // 等待所有除法任务完成
+        global_thread_pool->waitForAll();
     }
 }
 
@@ -485,9 +660,8 @@ struct CRTTaskArgs
     montgomery *m;
 };
 
-void* CRT_worker(void* arg) 
+void CRT_worker(CRTTaskArgs* args) 
 {
-    CRTTaskArgs* args = (CRTTaskArgs*)arg;
     auto& a = *args->a;
     auto& b = *args->b;
     auto& result = *args->result;
@@ -495,56 +669,32 @@ void* CRT_worker(void* arg)
     int len = args->len;
     uint64_t p = args->p;
 
-    m.toMontgomery(a);
-    m.toMontgomery(b);
-
     NTT_iterative(a, len, p, 1, m);
     NTT_iterative(b, len, p, 1, m);
 
-    for (int i = 0; i < len; ++i) 
+    // 用线程池进行点乘优化
+    int num_chunks = MAX_THREADS;
+    int chunk_size = (len + num_chunks - 1) / num_chunks;
+    
+    std::vector<ModMulTaskArgs> mul_args(num_chunks);
+    
+    for (int t = 0; t < num_chunks; ++t) 
     {
-        result[i] = m.ModMul(a[i], b[i]);
+        int start = t * chunk_size;
+        int end = std::min(start + chunk_size, len);
+        mul_args[t] = ModMulTaskArgs{&a, &b, &result, start, end, &m};
+        
+        global_thread_pool->enqueue([t, &mul_args]() 
+        {
+            ModMul_worker(&mul_args[t]);
+        });
     }
+    
+    // 等待所有点乘任务完成
+    global_thread_pool->waitForAll();
+    
     NTT_iterative(result, len, p, -1, m);
     m.fromMontgomery(result);
-
-    // if(p==1004535809)
-    // {
-    //     uint64_t check[len];
-    //     for(int i = 0; i < len; ++i)
-    //     {
-    //         check[i] = result[i];
-    //     }
-    //     fWrite(check, len / 2, "check_mods1_", 4);
-    // }
-    // if(p==104857601)
-    // {
-    //     uint64_t check[len];
-    //     for(int i = 0; i < len; ++i)
-    //     {
-    //         check[i] = result[i];
-    //     }
-    //     fWrite(check, len / 2, "check_mods2_", 4);
-    // }
-    // if(p==469762049)
-    // {
-    //     uint64_t check[len];
-    //     for(int i = 0; i < len; ++i)
-    //     {
-    //         check[i] = result[i];
-    //     }
-    //     fWrite(check, len / 2, "check_mods3_", 4);
-    // }
-    // if(p==998244353)
-    // {
-    //     uint64_t check[len];
-    //     for(int i = 0; i < len; ++i)
-    //     {
-    //         check[i] = result[i];
-    //     }
-    //     fWrite(check, len / 2, "check_mods4_", 4);
-    // }
-    return nullptr;
 }
 
 struct CRTPrecomputed 
@@ -583,14 +733,13 @@ struct CRTCombineArgs
     int l, r;
 };
 
-void* CRT_combine_worker(void* args) 
+void CRT_combine_worker(CRTCombineArgs* args) 
 {
-    CRTCombineArgs* data = (CRTCombineArgs*)args;
-    int l = data->l, r = data->r;
-    const auto& res_mods = *(data->res_mods);
-    const auto& mods = *(data->mods);
-    auto& result = *(data->result);
-    const auto& pre = *(data->pre);
+    int l = args->l, r = args->r;
+    const auto& res_mods = *(args->res_mods);
+    const auto& mods = *(args->mods);
+    auto& result = *(args->result);
+    const auto& pre = *(args->pre);
     int mod_count = mods.size();
 
     for (int i = l; i < r; ++i) 
@@ -602,34 +751,8 @@ void* CRT_combine_worker(void* args)
             __uint128_t term = t * pre.Mi[k] % pre.M;
             res = (res + term) % pre.M;
         }
-        result[i] = (uint64_t)(res % data->target_mod);
+        result[i] = (uint64_t)(res % args->target_mod);
     }
-    return nullptr;
-}
-
-struct ModMulTaskArgs 
-{
-    const std::vector<uint64_t> *a;
-    const std::vector<uint64_t> *b;
-    std::vector<uint64_t> *c;
-    int start;
-    int end;
-    montgomery *m;
-};
-
-void *ModMul_worker(void *args) 
-{
-    ModMulTaskArgs *data = (ModMulTaskArgs*)args;
-    const auto &a = *(data->a);
-    const auto &b = *(data->b);
-    auto &c = *(data->c);
-    montgomery *m = data->m;
-
-    for (int i = data->start; i < data->end; ++i) 
-    {
-        c[i] = m->ModMul(a[i], b[i]);
-    }
-    return nullptr;
 }
 
 //基4的位逆序置换函数
@@ -779,7 +902,7 @@ void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv,montgomery &m)
 uint64_t a[300000],b[300000],ab[300000];
 int main(int argc, char *argv[])
 {
-    
+    init_thread_pool();
     // 保证输入的所有模数的原根均为 3, 且模数都能表示为 a \times 4 ^ k + 1 的形式
     // 输入模数分别为 7340033 104857601 469762049 1337006139375617
     // 第四个模数超过了整型表示范围, 如果实现此模数意义下的多项式乘法需要修改框架
@@ -807,8 +930,6 @@ int main(int argc, char *argv[])
             montgomery(R, mods[2]),
             montgomery(R, mods[3])
         };
-        std::vector<CRTTaskArgs> threadData(4);
-        std::vector<pthread_t> threads(4);
         int len = 1;
         while(len<2*n_)
         {
@@ -831,11 +952,24 @@ int main(int argc, char *argv[])
             m.toMontgomery(b_1);
             NTT_iterative(a_1, len, p_, 1, m);
             NTT_iterative(b_1, len, p_, 1, m);
-            // m.ModMulSIMD(a_1, b_1, c);
-            for (int i = 0; i < len; ++i) 
+            // 使用线程池进行点乘
+            int chunk_size = (len + MAX_THREADS - 1) / MAX_THREADS;
+            std::vector<ModMulTaskArgs> mul_args(MAX_THREADS);
+            
+            for (int t = 0; t < MAX_THREADS; ++t) 
             {
-                c[i] = m.ModMul(a_1[i], b_1[i]);
+                int start = t * chunk_size;
+                int end = std::min(start + chunk_size, len);
+                mul_args[t] = ModMulTaskArgs{&a_1, &b_1, &c, start, end, &m};
+                
+                global_thread_pool->enqueue([t, &mul_args]() 
+                {
+                    ModMul_worker(&mul_args[t]);
+                });
             }
+            
+            // 等待所有点乘任务完成
+            global_thread_pool->waitForAll();
             NTT_iterative(c, len, p_, -1, m);
             m.fromMontgomery(c);
         }
@@ -843,57 +977,52 @@ int main(int argc, char *argv[])
         {
             std::vector<std::vector<uint64_t>> a_mods(4, std::vector<uint64_t>(len, 0));
             std::vector<std::vector<uint64_t>> b_mods(4, std::vector<uint64_t>(len, 0));
-            for (int k = 0; k < 4; ++k)
-            {
-                for (int j = 0; j < n_; ++j) 
-                {
-                    a_mods[k][j] = a[j];
-                    b_mods[k][j] = b[j];
-                }
-                threadData[k] = CRTTaskArgs{&a_mods[k], &b_mods[k], new std::vector<uint64_t>(len, 0), mods[k], len, &montgomery_instances[k]};
-                pthread_create(&threads[k], nullptr, CRT_worker, &threadData[k]);
-            }
-
-            //等待所有线程完成
+            std::vector<std::vector<uint64_t>> res_mods(4);
+            
+            // 准备数据
             for (int k = 0; k < 4; ++k) 
             {
-                pthread_join(threads[k], nullptr);
+                auto& m_k = montgomery_instances[k];
+                for (int j = 0; j < n_; ++j) 
+                {
+                    a_mods[k][j] = m_k.toMont(a_1[j]);
+                    b_mods[k][j] = m_k.toMont(b_1[j]);
+                }
+                res_mods[k].resize(len, 0);
             }
-
-            //CRT合并
-            int thread_count = 8;
-            std::vector<pthread_t> crt_threads(thread_count);
-            std::vector<CRTCombineArgs> crt_thread_data(thread_count);
-
-            std::vector<std::vector<uint64_t>> res_mods = 
+            
+            // 使用线程池并行处理4个模数的NTT
+            std::vector<CRTTaskArgs> crt_args(4);
+            for (int k = 0; k < 4; ++k) 
             {
-                *threadData[0].result,
-                *threadData[1].result,
-                *threadData[2].result,
-                *threadData[3].result
-            };
-
+                crt_args[k] = CRTTaskArgs{&a_mods[k], &b_mods[k], &res_mods[k], mods[k], len, &montgomery_instances[k]};
+                CRT_worker(&crt_args[k]);
+            }
+            
+            // 等待所有CRT任务完成
+            global_thread_pool->waitForAll();
+            
+            // CRT合并
+            int thread_count = MAX_THREADS;
+            std::vector<CRTCombineArgs> crt_thread_data(thread_count);
+            
             int block_size = (len + thread_count - 1) / thread_count;
             for (int t = 0; t < thread_count; ++t) 
             {
                 int l = t * block_size;
                 int r = std::min((t + 1) * block_size, len);
                 crt_thread_data[t] = CRTCombineArgs{&c, &res_mods, &mods, &pre, p_, l, r};
-                pthread_create(&crt_threads[t], nullptr, CRT_combine_worker, &crt_thread_data[t]);
+                
+                global_thread_pool->enqueue([t, &crt_thread_data]() 
+                {
+                    CRT_combine_worker(&crt_thread_data[t]);
+                });
             }
-
-            // 等待所有线程完成
-            for (int t = 0; t < thread_count; ++t) 
-            {
-                pthread_join(crt_threads[t], nullptr);
-            }
+            
+            // 等待所有CRT合并任务完成
+            global_thread_pool->waitForAll();
         }
         auto End = std::chrono::high_resolution_clock::now();
-        // 释放内存
-        for (int k = 0; k < 4; ++k) 
-        {
-            delete threadData[k].result;
-        }
         for (int i = 0; i < 2 * n_ - 1; ++i)
         {
             ab[i] = c[i];
@@ -907,5 +1036,6 @@ int main(int argc, char *argv[])
         // 禁止使用 cout 一次性输出大量文件内容
         fWrite(ab, n_, i);
     }
+    cleanup_thread_pool();
     return 0;
 }
