@@ -357,46 +357,6 @@ public:
 
 const int max_thread = 8;//CPU为8核
 
-struct NTTTaskArgs 
-{
-    std::vector<uint64_t>* a;
-    int n;
-    uint64_t p;
-    int len;
-    uint64_t wnR;
-    int start_block, end_block;
-    montgomery* m;
-};
-
-void* ntt_worker(void* arg) 
-{
-    NTTTaskArgs* args = (NTTTaskArgs*)arg;
-    auto& a = *args->a;
-    montgomery& m = *args->m;
-    uint64_t p = args->p;
-    int len = args->len;
-    uint64_t wnR = args->wnR;
-    int start_block = args->start_block, end_block = args->end_block;
-
-    for (int b = start_block; b < end_block; ++b) 
-    {
-        int i = b * len;
-        uint64_t w_mont = m.toMont(1);
-        for (int j = 0; j < len / 2; ++j) 
-        {
-            uint64_t u = a[i + j];
-            uint64_t v = m.ModMul(w_mont, a[i + j + len / 2]);
-            a[i + j] = (u + v) % p;
-            a[i + j + args->len / 2] = (u - v + args->p) % p;
-            // a[i + j] = m.montgomery_add(u, v, p);
-            // a[i + j + len / 2] = m.montgomery_sub(u, v, p);
-            w_mont = m.ModMul(w_mont, wnR);
-        }
-    }
-
-    return nullptr;
-}
-
 //下面是迭代的写法，据说更快（想必更快）
 //位转换置换，原来位转换置换有问题，索引交换错误
 void bit_reverse(std::vector<uint64_t> &a,int n)
@@ -431,36 +391,20 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv,montgome
         uint64_t wnR= m.toMont(wn);
 
         int total_blocks = n / len;
-        int num_threads = std::min(max_thread, total_blocks);
-        int chunk = (total_blocks + num_threads - 1) / num_threads;
 
-        pthread_t threads[max_thread];
-        NTTTaskArgs args[max_thread];
-
-        // for(int i = 0; i < n;i+=len) 
-        // {
-        //     uint64_t w_mont = m.toMont(1);
-        //     for (int j = 0; j < len / 2;++j) 
-        //     {
-        //         uint64_t u = a[i + j];
-        //         uint64_t v = m.ModMul(w_mont, a[i + j + len/2]);
-        //         a[i + j] = (u + v) % p;
-        //         a[i + j + len / 2] = (u - v + p) % p;
-        //         w_mont = m.ModMul(w_mont, wnR);
-        //     }
-        // }
-
-        for (int t = 0; t < num_threads; ++t) 
+        #pragma omp parallel for num_threads(max_thread) schedule(static)
+        for (int b = 0; b < total_blocks; ++b)
         {
-            int start = t * chunk;
-            int end = std::min(start + chunk, total_blocks);
-            args[t] = NTTTaskArgs{&a, n, p, len, wnR, start, end, &m};
-            pthread_create(&threads[t], nullptr, ntt_worker, &args[t]);
-        }
-
-        for (int t = 0; t < num_threads; ++t) 
-        {
-            pthread_join(threads[t], nullptr);
+            int i = b * len;
+            uint64_t w_mont = m.toMont(1);
+            for (int j = 0; j < len / 2; ++j)
+            {
+                uint64_t u = a[i + j];
+                uint64_t v = m.ModMul(w_mont, a[i + j + len / 2]);
+                a[i + j] = (u + v) % p;
+                a[i + j + len / 2] = (u + p - v) % p;
+                w_mont = m.ModMul(w_mont, wnR);
+            }
         }
     }
 
@@ -475,76 +419,22 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv,montgome
     }
 }
 
-struct CRTTaskArgs
+void CRT_parallel(std::vector<uint64_t>& a, std::vector<uint64_t>& b,std::vector<uint64_t>& result, int len, uint64_t p, montgomery& m)
 {
-    std::vector<uint64_t> *a;
-    std::vector<uint64_t> *b;
-    std::vector<uint64_t> *result;
-    uint64_t p;
-    int len;
-    montgomery *m;
-};
-
-void* CRT_worker(void* arg) 
-{
-    CRTTaskArgs* args = (CRTTaskArgs*)arg;
-    auto& a = *args->a;
-    auto& b = *args->b;
-    auto& result = *args->result;
-    montgomery& m = *args->m;
-    int len = args->len;
-    uint64_t p = args->p;
-
     m.toMontgomery(a);
     m.toMontgomery(b);
 
     NTT_iterative(a, len, p, 1, m);
     NTT_iterative(b, len, p, 1, m);
 
-    for (int i = 0; i < len; ++i) 
+    #pragma omp parallel for num_threads(max_thread)
+    for (int i = 0; i < len; ++i)
     {
         result[i] = m.ModMul(a[i], b[i]);
     }
+
     NTT_iterative(result, len, p, -1, m);
     m.fromMontgomery(result);
-
-    // if(p==1004535809)
-    // {
-    //     uint64_t check[len];
-    //     for(int i = 0; i < len; ++i)
-    //     {
-    //         check[i] = result[i];
-    //     }
-    //     fWrite(check, len / 2, "check_mods1_", 4);
-    // }
-    // if(p==104857601)
-    // {
-    //     uint64_t check[len];
-    //     for(int i = 0; i < len; ++i)
-    //     {
-    //         check[i] = result[i];
-    //     }
-    //     fWrite(check, len / 2, "check_mods2_", 4);
-    // }
-    // if(p==469762049)
-    // {
-    //     uint64_t check[len];
-    //     for(int i = 0; i < len; ++i)
-    //     {
-    //         check[i] = result[i];
-    //     }
-    //     fWrite(check, len / 2, "check_mods3_", 4);
-    // }
-    // if(p==998244353)
-    // {
-    //     uint64_t check[len];
-    //     for(int i = 0; i < len; ++i)
-    //     {
-    //         check[i] = result[i];
-    //     }
-    //     fWrite(check, len / 2, "check_mods4_", 4);
-    // }
-    return nullptr;
 }
 
 struct CRTPrecomputed 
@@ -573,63 +463,23 @@ CRTPrecomputed crt_precompute(const std::vector<uint64_t>& mods)
     return pre;
 }
 
-struct CRTCombineArgs 
+void CRT_combine_parallel(std::vector<uint64_t>& result,const std::vector<std::vector<uint64_t>>& res_mods,const std::vector<uint64_t>& mods,const CRTPrecomputed& pre,uint64_t target_mod)
 {
-    std::vector<uint64_t>* result;
-    const std::vector<std::vector<uint64_t>>* res_mods;
-    const std::vector<uint64_t>* mods;
-    const CRTPrecomputed* pre;
-    uint64_t target_mod;
-    int l, r;
-};
-
-void* CRT_combine_worker(void* args) 
-{
-    CRTCombineArgs* data = (CRTCombineArgs*)args;
-    int l = data->l, r = data->r;
-    const auto& res_mods = *(data->res_mods);
-    const auto& mods = *(data->mods);
-    auto& result = *(data->result);
-    const auto& pre = *(data->pre);
+    int n = result.size();
     int mod_count = mods.size();
 
-    for (int i = l; i < r; ++i) 
+    #pragma omp parallel for num_threads(max_thread)
+    for (int i = 0; i < n; ++i)
     {
         __uint128_t res = 0;
-        for (int k = 0; k < mod_count; ++k) 
+        for (int k = 0; k < mod_count; ++k)
         {
             uint64_t t = res_mods[k][i] * pre.inv[k] % mods[k];
             __uint128_t term = t * pre.Mi[k] % pre.M;
             res = (res + term) % pre.M;
         }
-        result[i] = (uint64_t)(res % data->target_mod);
+        result[i] = (uint64_t)(res % target_mod);
     }
-    return nullptr;
-}
-
-struct ModMulTaskArgs 
-{
-    const std::vector<uint64_t> *a;
-    const std::vector<uint64_t> *b;
-    std::vector<uint64_t> *c;
-    int start;
-    int end;
-    montgomery *m;
-};
-
-void *ModMul_worker(void *args) 
-{
-    ModMulTaskArgs *data = (ModMulTaskArgs*)args;
-    const auto &a = *(data->a);
-    const auto &b = *(data->b);
-    auto &c = *(data->c);
-    montgomery *m = data->m;
-
-    for (int i = data->start; i < data->end; ++i) 
-    {
-        c[i] = m->ModMul(a[i], b[i]);
-    }
-    return nullptr;
 }
 
 //基4的位逆序置换函数
@@ -807,8 +657,6 @@ int main(int argc, char *argv[])
             montgomery(R, mods[2]),
             montgomery(R, mods[3])
         };
-        std::vector<CRTTaskArgs> threadData(4);
-        std::vector<pthread_t> threads(4);
         int len = 1;
         while(len<2*n_)
         {
@@ -843,6 +691,9 @@ int main(int argc, char *argv[])
         {
             std::vector<std::vector<uint64_t>> a_mods(4, std::vector<uint64_t>(len, 0));
             std::vector<std::vector<uint64_t>> b_mods(4, std::vector<uint64_t>(len, 0));
+            std::vector<std::vector<uint64_t>> res_mods(4, std::vector<uint64_t>(len, 0));
+
+            #pragma omp parallel for num_threads(4)
             for (int k = 0; k < 4; ++k)
             {
                 for (int j = 0; j < n_; ++j) 
@@ -850,50 +701,12 @@ int main(int argc, char *argv[])
                     a_mods[k][j] = a[j];
                     b_mods[k][j] = b[j];
                 }
-                threadData[k] = CRTTaskArgs{&a_mods[k], &b_mods[k], new std::vector<uint64_t>(len, 0), mods[k], len, &montgomery_instances[k]};
-                pthread_create(&threads[k], nullptr, CRT_worker, &threadData[k]);
+                CRT_parallel(a_mods[k], b_mods[k], res_mods[k], len, mods[k], montgomery_instances[k]);
             }
 
-            //等待所有线程完成
-            for (int k = 0; k < 4; ++k) 
-            {
-                pthread_join(threads[k], nullptr);
-            }
-
-            //CRT合并
-            int thread_count = 8;
-            std::vector<pthread_t> crt_threads(thread_count);
-            std::vector<CRTCombineArgs> crt_thread_data(thread_count);
-
-            std::vector<std::vector<uint64_t>> res_mods = 
-            {
-                *threadData[0].result,
-                *threadData[1].result,
-                *threadData[2].result,
-                *threadData[3].result
-            };
-
-            int block_size = (len + thread_count - 1) / thread_count;
-            for (int t = 0; t < thread_count; ++t) 
-            {
-                int l = t * block_size;
-                int r = std::min((t + 1) * block_size, len);
-                crt_thread_data[t] = CRTCombineArgs{&c, &res_mods, &mods, &pre, p_, l, r};
-                pthread_create(&crt_threads[t], nullptr, CRT_combine_worker, &crt_thread_data[t]);
-            }
-
-            // 等待所有线程完成
-            for (int t = 0; t < thread_count; ++t) 
-            {
-                pthread_join(crt_threads[t], nullptr);
-            }
+            CRT_combine_parallel(c, res_mods, mods, pre, p_);
         }
         auto End = std::chrono::high_resolution_clock::now();
-        // 释放内存
-        for (int k = 0; k < 4; ++k) 
-        {
-            delete threadData[k].result;
-        }
         for (int i = 0; i < 2 * n_ - 1; ++i)
         {
             ab[i] = c[i];
