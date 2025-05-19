@@ -276,6 +276,7 @@ public:
 
     void toMontgomery(std::vector<uint64_t> &vec)
     {
+        #pragma omp parallel for num_threads(8)
         for (auto &x : vec)
         {
             x = toMont(x);
@@ -284,6 +285,7 @@ public:
 
     void fromMontgomery(std::vector<uint64_t> &vec)
     {
+        #pragma omp parallel for num_threads(8)
         for (auto &x : vec)
         {
             x = fromMont(x);
@@ -680,6 +682,7 @@ int main(int argc, char *argv[])
             NTT_iterative(a_1, len, p_, 1, m);
             NTT_iterative(b_1, len, p_, 1, m);
             // m.ModMulSIMD(a_1, b_1, c);
+            #pragma omp parallel for num_threads(8)
             for (int i = 0; i < len; ++i) 
             {
                 c[i] = m.ModMul(a_1[i], b_1[i]);
