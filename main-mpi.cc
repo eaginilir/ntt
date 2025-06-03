@@ -498,8 +498,6 @@ void ntt_worker(NTTTaskArgs* args)
     }
 }
 
-//下面是迭代的写法，据说更快（想必更快）
-//位转换置换，原来位转换置换有问题，索引交换错误
 void bit_reverse(std::vector<uint64_t> &a,int n)
 {
     for(int i = 1, j = 0; i < n;++i) 
@@ -576,50 +574,50 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv, barrett
     }
 }
 
-struct CRTTaskArgs
+// MPI相关结构体和函数
+struct MPICRTData 
 {
-    std::vector<uint64_t> *a;
-    std::vector<uint64_t> *b;
-    std::vector<uint64_t> *result;
-    uint64_t p;
+    std::vector<uint64_t> mods;
+    std::vector<std::vector<uint64_t>> a_mods;
+    std::vector<std::vector<uint64_t>> b_mods;
+    std::vector<std::vector<uint64_t>> res_mods;
+    std::vector<barrett> barrett_instances;
     int len;
-    barrett *b_ctx;
+    int start_mod_idx;
+    int end_mod_idx;
 };
 
-void CRT_worker(CRTTaskArgs* args) 
+// 每个进程处理分配给它的模数
+void process_mods_in_process(MPICRTData& data) 
 {
-    auto& a = *args->a;
-    auto& b = *args->b;
-    auto& result = *args->result;
-    barrett& b_ctx = *args->b_ctx;
-    int len = args->len;
-    uint64_t p = args->p;
-
-    NTT_iterative(a, len, p, 1, b_ctx);
-    NTT_iterative(b, len, p, 1, b_ctx);
-
-    int num_chunks = MAX_THREADS;
-    int chunk_size = (len + num_chunks - 1) / num_chunks;
-    
-    std::vector<ModMulTaskArgs> mul_args(num_chunks);
-    
-    for (int t = 0; t < num_chunks; ++t) 
+    for (int k = data.start_mod_idx; k < data.end_mod_idx; ++k) 
     {
-        int start = t * chunk_size;
-        int end = std::min(start + chunk_size, len);
-        mul_args[t] = ModMulTaskArgs{&a, &b, &result, start, end, &b_ctx};
+        // 执行NTT
+        NTT_iterative(data.a_mods[k], data.len, data.mods[k], 1, data.barrett_instances[k]);
+        NTT_iterative(data.b_mods[k], data.len, data.mods[k], 1, data.barrett_instances[k]);
         
-        global_thread_pool->enqueue([t, &mul_args]() 
+        // 点乘
+        int chunk_size = (data.len + MAX_THREADS - 1) / MAX_THREADS;
+        std::vector<ModMulTaskArgs> mul_args(MAX_THREADS);
+        
+        for (int t = 0; t < MAX_THREADS; ++t) 
         {
-            ModMul_worker(&mul_args[t]);
-        });
+            int start = t * chunk_size;
+            int end = std::min(start + chunk_size, data.len);
+            mul_args[t] = ModMulTaskArgs{&data.a_mods[k], &data.b_mods[k], &data.res_mods[k], start, end, &data.barrett_instances[k]};
+            
+            global_thread_pool->enqueue([t, &mul_args]() 
+            {
+                ModMul_worker(&mul_args[t]);
+            });
+        }
+        
+        global_thread_pool->waitForAll();
+        
+        // 逆NTT
+        NTT_iterative(data.res_mods[k], data.len, data.mods[k], -1, data.barrett_instances[k]);
     }
-    
-    global_thread_pool->waitForAll();
-    
-    NTT_iterative(result, len, p, -1, b_ctx);
 }
-
 
 struct CRTPrecomputed 
 {
@@ -647,46 +645,63 @@ CRTPrecomputed crt_precompute(const std::vector<uint64_t>& mods)
     return pre;
 }
 
-struct CRTCombineArgs 
+// CRT合并函数
+void CRT_combine_parallel(std::vector<uint64_t>& result, const std::vector<std::vector<uint64_t>>& res_mods,const std::vector<uint64_t>& mods,const CRTPrecomputed& pre,uint64_t target_mod,int len) 
 {
-    std::vector<uint64_t>* result;
-    const std::vector<std::vector<uint64_t>>* res_mods;
-    const std::vector<uint64_t>* mods;
-    const CRTPrecomputed* pre;
-    uint64_t target_mod;
-    int l, r;
-};
-
-void CRT_combine_worker(CRTCombineArgs* args) 
-{
-    int l = args->l, r = args->r;
-    const auto& res_mods = *(args->res_mods);
-    const auto& mods = *(args->mods);
-    auto& result = *(args->result);
-    const auto& pre = *(args->pre);
-    int mod_count = mods.size();
-
-    for (int i = l; i < r; ++i) 
+    int thread_count = MAX_THREADS;
+    int block_size = (len + thread_count - 1) / thread_count;
+    
+    for (int t = 0; t < thread_count; ++t) 
     {
-        __uint128_t res = 0;
-        for (int k = 0; k < mod_count; ++k) 
+        int l = t * block_size;
+        int r = std::min((t + 1) * block_size, len);
+        
+        global_thread_pool->enqueue([&result, &res_mods, &mods, &pre, target_mod, l, r]() 
         {
-            uint64_t t = res_mods[k][i] * pre.inv[k] % mods[k];
-            __uint128_t term = t * pre.Mi[k] % pre.M;
-            res = (res + term) % pre.M;
-        }
-        result[i] = (uint64_t)(res % args->target_mod);
+            int mod_count = mods.size();
+            for (int i = l; i < r; ++i) 
+            {
+                __uint128_t res = 0;
+                for (int k = 0; k < mod_count; ++k) 
+                {
+                    uint64_t t = res_mods[k][i] * pre.inv[k] % mods[k];
+                    __uint128_t term = t * pre.Mi[k] % pre.M;
+                    res = (res + term) % pre.M;
+                }
+                result[i] = (uint64_t)(res % target_mod);
+            }
+        });
     }
+    
+    global_thread_pool->waitForAll();
 }
 
 uint64_t a[300000],b[300000],ab[300000];
-int main(int argc, char *argv[])
+int main(int argc, char *argv[]) 
 {
+    // 初始化MPI
     MPI_Init(&argc, &argv);
+    
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
     init_thread_pool();
+    
+    // 定义模数
+    std::vector<uint64_t> mods = {1004535809, 1224736769, 469762049, 998244353};
+    int total_mods = mods.size();
+    
+    // 分配模数给各个进程
+    int mods_per_process = (total_mods + size - 1) / size;
+    int start_mod_idx = rank * mods_per_process;
+    int end_mod_idx = std::min(start_mod_idx + mods_per_process, total_mods);
+    
+    // 只有rank 0进程负责输出结果
+    if (rank == 0) 
+    {
+        std::cout << "使用 " << size << " 个MPI进程，每个进程使用 " << MAX_THREADS << " 个线程" << std::endl;
+    }
     // 保证输入的所有模数的原根均为 3, 且模数都能表示为 a \times 4 ^ k + 1 的形式
     // 输入模数分别为 7340033 104857601 469762049 1337006139375617
     // 第四个模数超过了整型表示范围, 如果实现此模数意义下的多项式乘法需要修改框架
@@ -695,131 +710,160 @@ int main(int argc, char *argv[])
     // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
     int test_begin = 0;
     int test_end = 4;
-    // for(int i = test_begin; i <= test_end; ++i){
-    for (int i = rank; i <= test_end; i += size) 
+    
+    for (int i = test_begin; i <= test_end; ++i) 
     {
-        if(i < test_begin)
-        {
-            continue;
-        }
-        long double ans = 0;
         uint64_t n_, p_;
-        fRead(a, b, &n_, &p_, i);
+        
+        // 只有rank 0进程读取输入
+        if (rank == 0) 
+        {
+            fRead(a, b, &n_, &p_, i);
+        }
+        
+        // 广播输入数据到所有进程
+        MPI_Bcast(&n_, sizeof(uint64_t), MPI_BYTE, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&p_, sizeof(uint64_t), MPI_BYTE, 0, MPI_COMM_WORLD);
+        MPI_Bcast(a, n_ * sizeof(uint64_t), MPI_BYTE, 0, MPI_COMM_WORLD);
+        MPI_Bcast(b, n_ * sizeof(uint64_t), MPI_BYTE, 0, MPI_COMM_WORLD);
+        
         memset(ab, 0, sizeof(ab));
-        //换大数有利于减少REDC的次数
         barrett b_ctx(p_);
-        //多模数分解
-        //基本能确定是四个模数的问题了，这四个模数还是太小了
-        std::vector<uint64_t> mods = {1004535809, 1224736769, 469762049, 998244353};
-        CRTPrecomputed pre = crt_precompute(mods);
-        std::vector<barrett> barrett_instances = {
-            barrett(mods[0]),
-            barrett(mods[1]),
-            barrett(mods[2]),
-            barrett(mods[3])
-        };
+        
+        // 计算变换长度
         int len = 1;
-        while(len<2*n_)
+        while (len < 2 * n_) 
         {
             len <<= 1;
         }
+        
         std::vector<uint64_t> a_1(len, 0);
         std::vector<uint64_t> b_1(len, 0);
-        for (int i = 0; i < n_; ++i)
+        for (int j = 0; j < n_; ++j) 
         {
-            a_1[i] = a[i];
-            b_1[i] = b[i];
+            a_1[j] = a[j];
+            b_1[j] = b[j];
         }
+        
         std::vector<uint64_t> c(len, 0);
         auto Start = std::chrono::high_resolution_clock::now();
         // TODO : 将 poly_multiply 函数替换成你写的 ntt
-        //小模数直接用朴素，等大模数再用CRT多线程
-        if(p_<(1ULL<<50))
+        // 小模数直接用单进程计算
+        if (p_ < (1ULL << 50)) 
         {
-            NTT_iterative(a_1, len, p_, 1, b_ctx);
-            NTT_iterative(b_1, len, p_, 1, b_ctx);
-            // 使用线程池进行点乘
-            int chunk_size = (len + MAX_THREADS - 1) / MAX_THREADS;
-            std::vector<ModMulTaskArgs> mul_args(MAX_THREADS);
-            
-            for (int t = 0; t < MAX_THREADS; ++t) 
+            if (rank == 0) 
             {
-                int start = t * chunk_size;
-                int end = std::min(start + chunk_size, len);
-                mul_args[t] = ModMulTaskArgs{&a_1, &b_1, &c, start, end, &b_ctx};
+                NTT_iterative(a_1, len, p_, 1, b_ctx);
+                NTT_iterative(b_1, len, p_, 1, b_ctx);
                 
-                global_thread_pool->enqueue([t, &mul_args]() 
+                // 使用线程池进行点乘
+                int chunk_size = (len + MAX_THREADS - 1) / MAX_THREADS;
+                std::vector<ModMulTaskArgs> mul_args(MAX_THREADS);
+                
+                for (int t = 0; t < MAX_THREADS; ++t) 
                 {
-                    ModMul_worker(&mul_args[t]);
-                });
+                    int start = t * chunk_size;
+                    int end = std::min(start + chunk_size, len);
+                    mul_args[t] = ModMulTaskArgs{&a_1, &b_1, &c, start, end, &b_ctx};
+                    
+                    global_thread_pool->enqueue([t, &mul_args]() 
+                    {
+                        ModMul_worker(&mul_args[t]);
+                    });
+                }
+                
+                global_thread_pool->waitForAll();
+                NTT_iterative(c, len, p_, -1, b_ctx);
+            }
+        } 
+        else 
+        {
+            // 大模数使用MPI+多线程优化
+            CRTPrecomputed pre = crt_precompute(mods);
+            
+            // 准备当前进程需要处理的模数数据
+            MPICRTData mpi_data;
+            mpi_data.mods = mods;
+            mpi_data.len = len;
+            mpi_data.start_mod_idx = start_mod_idx;
+            mpi_data.end_mod_idx = end_mod_idx;
+            
+            // 初始化Barrett实例
+            for (int k = 0; k < total_mods; ++k) 
+            {
+                mpi_data.barrett_instances.emplace_back(mods[k]);
             }
             
-            // 等待所有点乘任务完成
-            global_thread_pool->waitForAll();
-            NTT_iterative(c, len, p_, -1, b_ctx);
-        }
-        else
-        {
-            std::vector<std::vector<uint64_t>> a_mods(4, std::vector<uint64_t>(len, 0));
-            std::vector<std::vector<uint64_t>> b_mods(4, std::vector<uint64_t>(len, 0));
-            std::vector<std::vector<uint64_t>> res_mods(4);
+            // 准备数据（每个进程都需要准备所有模数的数据，但只处理分配给自己的）
+            mpi_data.a_mods.resize(total_mods);
+            mpi_data.b_mods.resize(total_mods);
+            mpi_data.res_mods.resize(total_mods);
             
-            // 准备数据
-            for (int k = 0; k < 4; ++k) 
+            for (int k = 0; k < total_mods; ++k) 
             {
+                mpi_data.a_mods[k].resize(len, 0);
+                mpi_data.b_mods[k].resize(len, 0);
+                mpi_data.res_mods[k].resize(len, 0);
+                
                 for (int j = 0; j < n_; ++j) 
                 {
-                    a_mods[k][j] = a_1[j] % mods[k];
-                    b_mods[k][j] = b_1[j] % mods[k];
+                    mpi_data.a_mods[k][j] = a_1[j] % mods[k];
+                    mpi_data.b_mods[k][j] = b_1[j] % mods[k];
                 }
-                res_mods[k].resize(len, 0);
             }
             
-            // 使用线程池并行处理4个模数的NTT
-            std::vector<CRTTaskArgs> crt_args(4);
-            for (int k = 0; k < 4; ++k) 
+            // 每个进程处理分配给它的模数
+            process_mods_in_process(mpi_data);
+            
+            // 收集所有进程的结果到rank 0
+            if (rank == 0) 
             {
-                crt_args[k] = CRTTaskArgs{&a_mods[k], &b_mods[k], &res_mods[k], mods[k], len, &barrett_instances[k]};
-                CRT_worker(&crt_args[k]);
-            }
-            
-            // 等待所有CRT任务完成
-            global_thread_pool->waitForAll();
-            
-            // CRT合并
-            int thread_count = MAX_THREADS;
-            std::vector<CRTCombineArgs> crt_thread_data(thread_count);
-            
-            int block_size = (len + thread_count - 1) / thread_count;
-            for (int t = 0; t < thread_count; ++t) 
-            {
-                int l = t * block_size;
-                int r = std::min((t + 1) * block_size, len);
-                crt_thread_data[t] = CRTCombineArgs{&c, &res_mods, &mods, &pre, p_, l, r};
-                
-                global_thread_pool->enqueue([t, &crt_thread_data]() 
+                // 接收其他进程的结果
+                for (int src = 1; src < size; ++src) 
                 {
-                    CRT_combine_worker(&crt_thread_data[t]);
-                });
+                    int src_start = src * mods_per_process;
+                    int src_end = std::min(src_start + mods_per_process, total_mods);
+                    
+                    for (int k = src_start; k < src_end; ++k) 
+                    {
+                        MPI_Recv(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, src, k, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    }
+                }
+            }
+            else 
+            {
+                // 发送结果到rank 0
+                for (int k = start_mod_idx; k < end_mod_idx; ++k) 
+                {
+                    MPI_Send(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, 0, k, MPI_COMM_WORLD);
+                }
             }
             
-            // 等待所有CRT合并任务完成
-            global_thread_pool->waitForAll();
+            // 只有rank 0进行CRT合并
+            if (rank == 0) 
+            {
+                CRT_combine_parallel(c, mpi_data.res_mods, mods, pre, p_, len);
+            }
         }
-        auto End = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < 2 * n_ - 1; ++i)
+        
+        if (rank == 0) 
         {
-            ab[i] = c[i];
+            auto End = std::chrono::high_resolution_clock::now();
+            
+            for (int j = 0; j < 2 * n_ - 1; ++j) 
+            {
+                ab[j] = c[j];
+            }
+            
+            std::chrono::duration<double, std::ratio<1, 1000>> elapsed = End - Start;
+            fCheck(ab, n_, i);
+            std::cout<<"average latency for n = "<<n_<<" p = "<<p_<<" : "<<elapsed.count()<<" (us) "<<std::endl;
+            // 可以使用 fWrite 函数将 ab 的输出结果打印到 files 文件夹下
+            // 禁止使用 cout 一次性输出大量文件内容
+            fWrite(ab, n_, i);
         }
-        // fWrite(ab, len / 2, "true_result_mods4_", i);
-        std::chrono::duration<double,std::ratio<1,1000>>elapsed = End - Start;
-        ans += elapsed.count();
-        fCheck(ab, n_, i);
-        std::cout<<"average latency for n = "<<n_<<" p = "<<p_<<" : "<<ans<<" (us) "<<std::endl;
-        // 可以使用 fWrite 函数将 ab 的输出结果打印到 files 文件夹下
-        // 禁止使用 cout 一次性输出大量文件内容
-        fWrite(ab, n_, i);
     }
+    
     cleanup_thread_pool();
     MPI_Finalize();
     return 0;
