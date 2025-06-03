@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
-#include <arm_neon.h>
+// #include <arm_neon.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <shared_mutex>
@@ -19,36 +19,43 @@
 // 可以自行添加需要的头文件
 
 void fRead(uint64_t *a, uint64_t *b, uint64_t *n, uint64_t *p, int input_id){
-    // 数据输入函数
-    std::string str1 = "/nttdata/";
-    std::string str2 = std::to_string(input_id);
-    std::string strin = str1 + str2 + ".in";
-    char data_path[strin.size() + 1];
-    std::copy(strin.begin(), strin.end(), data_path);
-    data_path[strin.size()] = '\0';
-    std::ifstream fin;
-    fin.open(data_path, std::ios::in);
-    fin>>*n>>*p;
-    for (int i = 0; i < *n; i++){
-        fin>>a[i];
+    std::string strin = "D:\\study\\concurrent processing\\NTT\\ntt\\nttdata\\4.in";
+    std::ifstream fin(strin);
+
+    if (!fin.is_open()) {
+        std::cerr << "❌ 文件打不开，路径是: " << strin << std::endl;
+        return;
     }
-    for (int i = 0; i < *n; i++){   
-        fin>>b[i];
+
+    fin >> *n >> *p;
+    if (fin.fail()) {
+        std::cerr << "❌ 无法读取 n 和 p，请检查文件格式。" << std::endl;
+        return;
+    }
+
+    std::cout << "✅ 成功读取 n = " << *n << ", p = " << *p << std::endl;
+
+    for (int i = 0; i < *n; i++) {
+        fin >> a[i];
+    }
+    for (int i = 0; i < *n; i++) {
+        fin >> b[i];
     }
 }
 
+
 void fCheck(uint64_t *ab, int n, int input_id){
     // 判断多项式乘法结果是否正确
-    std::string str1 = "/nttdata/";
-    std::string str2 = std::to_string(input_id);
-    std::string strout = str1 + str2 + ".out";
     std::string logout = "files/log.out";
-    char data_path[strout.size() + 1];
-    std::copy(strout.begin(), strout.end(), data_path);
-    data_path[strout.size()] = '\0';
+    std::string strin = "D:\\study\\concurrent processing\\NTT\\ntt\\nttdata\\4.out";
     std::ifstream fin;
     std::ofstream fout(logout, std::ios::app);
-    fin.open(data_path, std::ios::in);
+    fin.open(strin, std::ios::in);
+
+    if (!fin.is_open()) {
+        std::cerr << "❌ 无法打开输出文件: " << strin << std::endl;
+        return;
+    }
 
     // if(input_id==4)
     // {
@@ -83,14 +90,9 @@ void fCheck(uint64_t *ab, int n, int input_id){
 
 void fWrite(uint64_t *ab, int n, int input_id){
     // 数据输出函数, 可以用来输出最终结果, 也可用于调试时输出中间数组
-    std::string str1 = "files/";
-    std::string str2 = std::to_string(input_id);
-    std::string strout = str1 + str2 + ".out";
-    char output_path[strout.size() + 1];
-    std::copy(strout.begin(), strout.end(), output_path);
-    output_path[strout.size()] = '\0';
+    std::string strout = "D:\\study\\concurrent processing\\NTT\\ntt\\files\\4.out";
     std::ofstream fout;
-    fout.open(output_path, std::ios::out);
+    fout.open(strout, std::ios::out);
     for (int i = 0; i < n * 2 - 1; i++){
         fout<<ab[i]<<'\n';
     }
@@ -184,9 +186,9 @@ public:
         uint64_t N_inv = modinv(N, R);
         N_inv_neg = R - N_inv;
         R2 = (__uint128_t(R) * R) % N;
-        vec_modulus = vdupq_n_u64(N);
-        vec_inv = vdupq_n_u64(N_inv);
-        vec_R2 = vdupq_n_u64(R2);
+        // vec_modulus = vdupq_n_u64(N);
+        // vec_inv = vdupq_n_u64(N_inv);
+        // vec_R2 = vdupq_n_u64(R2);
     }
 
     static uint64_t gcd_extended(uint64_t a, uint64_t b, int64_t &x, int64_t &y) 
@@ -292,69 +294,69 @@ public:
         }
     }
 
-    //完整版乘法
-    void ModMulSIMD(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, std::vector<uint64_t> &res)
-    {
-        size_t n = a.size();
-        res.resize(n);
-        for (size_t i = 0; i < n; i += 2) 
-        {
-            //拆分为 32-bit 高低位
-            uint32x2_t a_lo = {uint32_t(a[i]), uint32_t(a[i + 1])};
-            uint32x2_t a_hi = {uint32_t(a[i] >> 32), uint32_t(a[i + 1] >> 32)};
-            uint32x2_t b_lo = {uint32_t(b[i]), uint32_t(b[i + 1])};
-            uint32x2_t b_hi = {uint32_t(b[i] >> 32), uint32_t(b[i + 1] >> 32)};
+    // //完整版乘法
+    // void ModMulSIMD(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b, std::vector<uint64_t> &res)
+    // {
+    //     size_t n = a.size();
+    //     res.resize(n);
+    //     for (size_t i = 0; i < n; i += 2) 
+    //     {
+    //         //拆分为 32-bit 高低位
+    //         uint32x2_t a_lo = {uint32_t(a[i]), uint32_t(a[i + 1])};
+    //         uint32x2_t a_hi = {uint32_t(a[i] >> 32), uint32_t(a[i + 1] >> 32)};
+    //         uint32x2_t b_lo = {uint32_t(b[i]), uint32_t(b[i + 1])};
+    //         uint32x2_t b_hi = {uint32_t(b[i] >> 32), uint32_t(b[i + 1] >> 32)};
 
-            //计算各部分乘积
-            uint64x2_t lo = vmull_u32(a_lo, b_lo);
-            uint64x2_t hi = vmull_u32(a_hi, b_hi); 
-            uint64x2_t mid1 = vmull_u32(a_hi, b_lo); 
-            uint64x2_t mid2 = vmull_u32(a_lo, b_hi);
-            uint64x2_t mid = vaddq_u64(mid1, mid2);
+    //         //计算各部分乘积
+    //         uint64x2_t lo = vmull_u32(a_lo, b_lo);
+    //         uint64x2_t hi = vmull_u32(a_hi, b_hi); 
+    //         uint64x2_t mid1 = vmull_u32(a_hi, b_lo); 
+    //         uint64x2_t mid2 = vmull_u32(a_lo, b_hi);
+    //         uint64x2_t mid = vaddq_u64(mid1, mid2);
 
-            __uint128_t prod0 = (__uint128_t)vgetq_lane_u64(lo, 0);
-            prod0 += (__uint128_t)vgetq_lane_u64(mid, 0) << 32;
-            prod0 += (__uint128_t)vgetq_lane_u64(hi, 0) << 64;
-            res[i] = REDC(prod0);
+    //         __uint128_t prod0 = (__uint128_t)vgetq_lane_u64(lo, 0);
+    //         prod0 += (__uint128_t)vgetq_lane_u64(mid, 0) << 32;
+    //         prod0 += (__uint128_t)vgetq_lane_u64(hi, 0) << 64;
+    //         res[i] = REDC(prod0);
 
-            __uint128_t prod1 = (__uint128_t)vgetq_lane_u64(lo, 1);
-            prod1 += (__uint128_t)vgetq_lane_u64(mid, 1) << 32;
-            prod1 += (__uint128_t)vgetq_lane_u64(hi, 1) << 64;
-            res[i + 1] = REDC(prod1);
-        }
-    }
+    //         __uint128_t prod1 = (__uint128_t)vgetq_lane_u64(lo, 1);
+    //         prod1 += (__uint128_t)vgetq_lane_u64(mid, 1) << 32;
+    //         prod1 += (__uint128_t)vgetq_lane_u64(hi, 1) << 64;
+    //         res[i + 1] = REDC(prod1);
+    //     }
+    // }
 
-    inline uint64x2_t ModAddSIMD(uint64x2_t a, uint64x2_t b)
-    {
-        uint64x2_t sum = vaddq_u64(a, b);
-        uint64x2_t cmp = vcgeq_u64(sum, vec_modulus);  // sum >= modulus
-        return vbslq_u64(cmp, vsubq_u64(sum, vec_modulus), sum);
-    }
+    // inline uint64x2_t ModAddSIMD(uint64x2_t a, uint64x2_t b)
+    // {
+    //     uint64x2_t sum = vaddq_u64(a, b);
+    //     uint64x2_t cmp = vcgeq_u64(sum, vec_modulus);  // sum >= modulus
+    //     return vbslq_u64(cmp, vsubq_u64(sum, vec_modulus), sum);
+    // }
 
-    inline uint64x2_t ModSubSIMD(uint64x2_t a, uint64x2_t b)
-    {
-        uint64x2_t diff = vsubq_u64(a, b);
-        uint64x2_t cmp = vcgtq_u64(b, a);  // b > a
-        return vbslq_u64(cmp, vaddq_u64(diff, vec_modulus), diff);
-    }
+    // inline uint64x2_t ModSubSIMD(uint64x2_t a, uint64x2_t b)
+    // {
+    //     uint64x2_t diff = vsubq_u64(a, b);
+    //     uint64x2_t cmp = vcgtq_u64(b, a);  // b > a
+    //     return vbslq_u64(cmp, vaddq_u64(diff, vec_modulus), diff);
+    // }
 
-    inline uint64x2_t ModMulSIMD(uint64x2_t a, uint64x2_t b)
-    {
-        alignas(16) uint64_t a_raw[2], b_raw[2];
-        vst1q_u64(a_raw, a);
-        vst1q_u64(b_raw, b);
+    // inline uint64x2_t ModMulSIMD(uint64x2_t a, uint64x2_t b)
+    // {
+    //     alignas(16) uint64_t a_raw[2], b_raw[2];
+    //     vst1q_u64(a_raw, a);
+    //     vst1q_u64(b_raw, b);
 
-        uint64_t r0 = ModMul(a_raw[0], b_raw[0]);
-        uint64_t r1 = ModMul(a_raw[1], b_raw[1]);
+    //     uint64_t r0 = ModMul(a_raw[0], b_raw[0]);
+    //     uint64_t r1 = ModMul(a_raw[1], b_raw[1]);
 
-        return (uint64x2_t){r0, r1};
-    }
+    //     return (uint64x2_t){r0, r1};
+    // }
 public:
     uint64_t N, R, R2, N_inv_neg;
     int logR;
-    uint64x2_t vec_modulus;
-    uint64x2_t vec_inv;
-    uint64x2_t vec_R2;
+    // uint64x2_t vec_modulus;
+    // uint64x2_t vec_inv;
+    // uint64x2_t vec_R2;
 };
 
 const int max_thread = 8;//CPU为8核
@@ -510,123 +512,6 @@ void bit_reverse_radix4(std::vector<uint64_t> &a, int n)
     }
 }
 
-void NTT_radix4(std::vector<uint64_t> &a, int n, int p, int inv,montgomery &m) 
-{
-    int g = 3;
-    bit_reverse_radix4(a, n);
-
-    for (int len = 4; len <= n; len <<= 2) 
-    {
-        int step = len >> 2;
-        uint64_t w = power(g, (p - 1) / len, p);
-        if (inv == -1) 
-        {
-            w = power(w, p - 2, p);
-        }
-        uint64_t imag = power(w, step, p);
-
-        uint64_t wR = m.toMont(w);
-        uint64_t w2R = m.ModMul(wR, wR);
-        uint64_t w3R = m.ModMul(w2R, wR);
-        uint64_t imagR = m.toMont(imag);
-
-        for (int i = 0; i < n; i += len) 
-        {
-            uint64_t w1R_current = m.toMont(1);
-            uint64_t w2R_lane_current = m.toMont(1);
-            uint64_t w3R_lane_current = m.toMont(1);
-
-            for (int j = 0; j < step; j += 2) 
-            {
-                if (j + 1 >= step) break; //处理奇数step时的边界
-
-                //生成旋转因子向量
-                uint64_t w1R_j1 = m.ModMul(w1R_current, wR);
-                uint64x2_t w1R_vec = vcombine_u64(vcreate_u64(w1R_current), vcreate_u64(w1R_j1));
-
-                uint64_t w2R_j1 = m.ModMul(w2R_lane_current, w2R);
-                uint64x2_t w2R_lane_vec = vcombine_u64(vcreate_u64(w2R_lane_current), vcreate_u64(w2R_j1));
-
-                uint64_t w3R_j1 = m.ModMul(w3R_lane_current, w3R);
-                uint64x2_t w3R_lane_vec = vcombine_u64(vcreate_u64(w3R_lane_current), vcreate_u64(w3R_j1));
-
-                uint64x2_t imagR_vec = vdupq_n_u64(imagR);
-
-                //加载数据
-                uint64x2_t a0 = vld1q_u64(&a[i + j]);
-                uint64x2_t a1 = vld1q_u64(&a[i + j + step]);
-                uint64x2_t a2 = vld1q_u64(&a[i + j + 2 * step]);
-                uint64x2_t a3 = vld1q_u64(&a[i + j + 3 * step]);
-
-                //计算t1, t2, t3
-                uint64x2_t t1 = m.ModMulSIMD(a1, w1R_vec);
-                uint64x2_t t2 = m.ModMulSIMD(a2, w2R_lane_vec);
-                uint64x2_t t3 = m.ModMulSIMD(a3, w3R_lane_vec);
-
-                //计算中间项
-                uint64x2_t t1i = m.ModMulSIMD(t1, imagR_vec);
-                uint64x2_t t3i = m.ModMulSIMD(t3, imagR_vec);
-
-                //计算y0-y3
-                uint64x2_t y0 = m.ModAddSIMD(m.ModAddSIMD(m.ModAddSIMD(a0, t1), t2), t3);
-                uint64x2_t y1 = m.ModSubSIMD(m.ModSubSIMD(m.ModAddSIMD(a0, t1i), t2), t3i);
-                uint64x2_t y2 = m.ModSubSIMD(m.ModAddSIMD(m.ModSubSIMD(a0, t1), t2), t3);
-                uint64x2_t y3 = m.ModAddSIMD(m.ModSubSIMD(m.ModSubSIMD(a0, t1i), t2), t3i);
-
-                //存储结果
-                vst1q_u64(&a[i + j], y0);
-                vst1q_u64(&a[i + j + step], y1);
-                vst1q_u64(&a[i + j + 2 * step], y2);
-                vst1q_u64(&a[i + j + 3 * step], y3);
-
-                //更新旋转因子
-                w1R_current = m.ModMul(w1R_current, m.ModMul(wR, wR));
-                w2R_lane_current = m.ModMul(w2R_lane_current, m.ModMul(w2R, w2R));
-                w3R_lane_current = m.ModMul(w3R_lane_current, m.ModMul(w3R, w3R));
-            }
-            //处理剩余的j（step为奇数）
-            if (step % 2 != 0) 
-            {
-                int j = step - 1;
-                uint64_t a0R = a[i + j];
-                uint64_t a1R = a[i + j + step];
-                uint64_t a2R = a[i + j + 2 * step];
-                uint64_t a3R = a[i + j + 3 * step];
-
-                uint64_t t1R = m.ModMul(a1R, w1R_current);
-                uint64_t t2R = m.ModMul(a2R, w2R_lane_current);
-                uint64_t t3R = m.ModMul(a3R, w3R_lane_current);
-
-                uint64_t t1iR = m.ModMul(t1R, imagR);
-                uint64_t t3iR = m.ModMul(t3R, imagR);
-
-                uint64_t y0R = m.add(m.add(m.add(a0R, t1R), t2R), t3R);
-                uint64_t y1R = m.sub(m.sub(m.add(a0R, t1iR), t2R), t3iR);
-                uint64_t y2R = m.sub(m.add(m.sub(a0R, t1R), t2R), t3R);
-                uint64_t y3R = m.add(m.sub(m.sub(a0R, t1iR), t2R), t3iR);
-
-                a[i + j] = y0R;
-                a[i + j + step] = y1R;
-                a[i + j + 2 * step] = y2R;
-                a[i + j + 3 * step] = y3R;
-            }
-        }
-    }
-    if (inv == -1) 
-    {
-        // int inv_n = power(n, p - 2, p);
-        uint64_t inv_n = power(n, p - 2, p);
-        uint64_t invR = m.toMont(inv_n);
-        uint64x2_t invR_vec = vdupq_n_u64(invR);
-        for (size_t i = 0; i < a.size(); i += 2) 
-        {
-            uint64x2_t x = vld1q_u64(&a[i]);
-            x = m.ModMulSIMD(x, invR_vec);
-            vst1q_u64(&a[i], x);
-        }
-    }
-}
-
 // int a[300000], b[300000];
 uint64_t a[300000],b[300000],ab[300000];
 int main(int argc, char *argv[])
@@ -638,7 +523,7 @@ int main(int argc, char *argv[])
     // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
     // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
     // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
-    int test_begin = 0;
+    int test_begin = 4;
     int test_end = 4;
     for(int i = test_begin; i <= test_end; ++i){
         long double ans = 0;
