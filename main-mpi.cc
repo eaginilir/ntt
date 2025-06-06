@@ -187,57 +187,38 @@ class barrett
 public:
     barrett(uint64_t mod_) : mod(mod_) 
     {
-        // 计算Barrett预计算值
-        // k = ceil(log2(mod)) + 1，通常取64位
         k = 64;
-        // mu = floor(2^k / mod)
         mu = (__uint128_t(1) << k) / mod;
-        
-        // 预计算一些常用值
-        mod_neg = (~mod) + 1; // -mod in two's complement
-        
-        // NEON向量化预计算
-        vec_mod = vdupq_n_u64(mod);
-        vec_mu_low = vdupq_n_u64((uint64_t)mu);
-        vec_mu_high = vdupq_n_u64((uint64_t)(mu >> 32));
+
+        mod_neg = (~mod) + 1;
     }
 
-    // Barrett规约：计算 x mod m
     inline uint64_t reduce(uint64_t x) const
     {
         if (x < mod) return x;
-        
-        // q = floor(x * mu / 2^k) ≈ floor(x / mod)
+
         __uint128_t q = ((__uint128_t)x * mu) >> k;
-        
-        // r = x - q * mod
+
         uint64_t r = x - (uint64_t)q * mod;
-        
-        // 如果r >= mod，则r -= mod（最多需要一次）
+
         return r >= mod ? r - mod : r;
     }
 
-    // Barrett模乘：计算 (a * b) mod m
     inline uint64_t mul(uint64_t a, uint64_t b) const
     {
         __uint128_t product = (__uint128_t)a * b;
         return reduce_128(product);
     }
 
-    // 针对128位数的Barrett规约
     inline uint64_t reduce_128(__uint128_t x) const
     {
         if (x < mod) return (uint64_t)x;
-        
-        // 对于128位数，我们需要更仔细的处理
-        // q = floor(x * mu / 2^k)
+
         __uint128_t q = (x >> (k - 64)) * mu >> 64;
-        
-        // r = x - q * mod
+
         __uint128_t qm = q * mod;
         uint64_t r = (uint64_t)(x - qm);
-        
-        // 最多需要两次减法
+
         if (r >= mod) r -= mod;
         if (r >= mod) r -= mod;
         
@@ -257,7 +238,6 @@ public:
         return a >= b ? a - b : a + mod - b;
     }
 
-    // 快速模加法（避免分支）
     inline uint64_t fast_add(uint64_t a, uint64_t b) const 
     {
         uint64_t sum = a + b;
@@ -265,35 +245,17 @@ public:
         return sum - (mask & mod);
     }
 
-    // 快速模减法（避免分支）
     inline uint64_t fast_sub(uint64_t a, uint64_t b) const 
     {
         uint64_t diff = a - b;
         uint64_t mask = -(a < b);
         return diff + (mask & mod);
     }
-
-    // NEON向量化Barrett规约（处理4个64位数）
-    inline uint64x2_t vec_reduce(uint64x2_t x_low, uint64x2_t x_high) const
-    {
-        // 这里可以实现NEON向量化的Barrett规约
-        // 由于复杂性，先使用标量版本
-        uint64_t result[2];
-        result[0] = reduce(((__uint128_t)vgetq_lane_u64(x_high, 0) << 64) | vgetq_lane_u64(x_low, 0));
-        result[1] = reduce(((__uint128_t)vgetq_lane_u64(x_high, 1) << 64) | vgetq_lane_u64(x_low, 1));
-        return vld1q_u64(result);
-    }
-
 public:
     uint64_t mod;
     __uint128_t mu;
     int k;
     uint64_t mod_neg;
-    
-    // NEON预计算值
-    uint64x2_t vec_mod;
-    uint64x2_t vec_mu_low;
-    uint64x2_t vec_mu_high;
 };
 
 // 线程池实现
@@ -426,6 +388,73 @@ void cleanup_thread_pool()
     {
         delete global_thread_pool;
         global_thread_pool = nullptr;
+    }
+}
+
+// 内存池管理
+class MemoryPool 
+{
+private:
+    std::vector<std::vector<uint64_t>> buffers;
+    std::queue<int> available_buffers;
+    std::mutex pool_mutex;
+    int buffer_size;
+    int max_buffers;
+
+public:
+    MemoryPool(int buf_size, int max_buf) : buffer_size(buf_size), max_buffers(max_buf) 
+    {
+        for (int i = 0; i < max_buffers; ++i) 
+        {
+            buffers.emplace_back(buffer_size, 0);
+            available_buffers.push(i);
+        }
+    }
+
+    std::vector<uint64_t>* get_buffer() 
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (available_buffers.empty()) 
+        {
+            return nullptr;
+        }
+        int idx = available_buffers.front();
+        available_buffers.pop();
+        return &buffers[idx];
+    }
+
+    void return_buffer(std::vector<uint64_t>* buffer) 
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        // 找到buffer对应的索引
+        for (int i = 0; i < buffers.size(); ++i) 
+        {
+            if (&buffers[i] == buffer) 
+            {
+                available_buffers.push(i);
+                break;
+            }
+        }
+    }
+};
+
+// 全局内存池
+MemoryPool* global_memory_pool = nullptr;
+
+void init_memory_pool(int buffer_size, int max_buffers) 
+{
+    if (global_memory_pool == nullptr) 
+    {
+        global_memory_pool = new MemoryPool(buffer_size, max_buffers);
+    }
+}
+
+void cleanup_memory_pool() 
+{
+    if (global_memory_pool != nullptr) 
+    {
+        delete global_memory_pool;
+        global_memory_pool = nullptr;
     }
 }
 
@@ -714,152 +743,138 @@ int main(int argc, char *argv[])
     for (int i = test_begin; i <= test_end; ++i) 
     {
         uint64_t n_, p_;
-        
-        // 只有rank 0进程读取输入
+
         if (rank == 0) 
         {
             fRead(a, b, &n_, &p_, i);
         }
-        
-        // 广播输入数据到所有进程
+
         MPI_Bcast(&n_, sizeof(uint64_t), MPI_BYTE, 0, MPI_COMM_WORLD);
         MPI_Bcast(&p_, sizeof(uint64_t), MPI_BYTE, 0, MPI_COMM_WORLD);
         MPI_Bcast(a, n_ * sizeof(uint64_t), MPI_BYTE, 0, MPI_COMM_WORLD);
         MPI_Bcast(b, n_ * sizeof(uint64_t), MPI_BYTE, 0, MPI_COMM_WORLD);
-        
+
         memset(ab, 0, sizeof(ab));
         barrett b_ctx(p_);
-        
-        // 计算变换长度
+
         int len = 1;
-        while (len < 2 * n_) 
-        {
-            len <<= 1;
-        }
-        
+        while (len < 2 * n_) len <<= 1;
+
         std::vector<uint64_t> a_1(len, 0);
         std::vector<uint64_t> b_1(len, 0);
+        std::vector<uint64_t> c(len, 0);
         for (int j = 0; j < n_; ++j) 
         {
             a_1[j] = a[j];
             b_1[j] = b[j];
         }
-        
-        std::vector<uint64_t> c(len, 0);
-        auto Start = std::chrono::high_resolution_clock::now();
-        // TODO : 将 poly_multiply 函数替换成你写的 ntt
-        // 小模数直接用单进程计算
-        if (p_ < (1ULL << 50)) 
+
+        double total_time = 0.0;
+        for (int repeat = 0; repeat < 50; ++repeat) 
         {
-            if (rank == 0) 
+            auto Start = std::chrono::high_resolution_clock::now();
+
+            if (p_ < (1ULL << 50)) 
             {
-                NTT_iterative(a_1, len, p_, 1, b_ctx);
-                NTT_iterative(b_1, len, p_, 1, b_ctx);
-                
-                // 使用线程池进行点乘
-                int chunk_size = (len + MAX_THREADS - 1) / MAX_THREADS;
-                std::vector<ModMulTaskArgs> mul_args(MAX_THREADS);
-                
-                for (int t = 0; t < MAX_THREADS; ++t) 
+                if (rank == 0) 
                 {
-                    int start = t * chunk_size;
-                    int end = std::min(start + chunk_size, len);
-                    mul_args[t] = ModMulTaskArgs{&a_1, &b_1, &c, start, end, &b_ctx};
+                    std::vector<uint64_t> a_temp = a_1, b_temp = b_1;
+                    std::fill(c.begin(), c.end(), 0);
+
+                    NTT_iterative(a_temp, len, p_, 1, b_ctx);
+                    NTT_iterative(b_temp, len, p_, 1, b_ctx);
+
+                    int chunk_size = (len + MAX_THREADS - 1) / MAX_THREADS;
+                    std::vector<ModMulTaskArgs> mul_args(MAX_THREADS);
                     
-                    global_thread_pool->enqueue([t, &mul_args]() 
+                    for (int t = 0; t < MAX_THREADS; ++t) 
                     {
-                        ModMul_worker(&mul_args[t]);
-                    });
-                }
-                
-                global_thread_pool->waitForAll();
-                NTT_iterative(c, len, p_, -1, b_ctx);
-            }
-        } 
-        else 
-        {
-            // 大模数使用MPI+多线程优化
-            CRTPrecomputed pre = crt_precompute(mods);
-            
-            // 准备当前进程需要处理的模数数据
-            MPICRTData mpi_data;
-            mpi_data.mods = mods;
-            mpi_data.len = len;
-            mpi_data.start_mod_idx = start_mod_idx;
-            mpi_data.end_mod_idx = end_mod_idx;
-            
-            // 初始化Barrett实例
-            for (int k = 0; k < total_mods; ++k) 
-            {
-                mpi_data.barrett_instances.emplace_back(mods[k]);
-            }
-            
-            // 准备数据（每个进程都需要准备所有模数的数据，但只处理分配给自己的）
-            mpi_data.a_mods.resize(total_mods);
-            mpi_data.b_mods.resize(total_mods);
-            mpi_data.res_mods.resize(total_mods);
-            
-            for (int k = 0; k < total_mods; ++k) 
-            {
-                mpi_data.a_mods[k].resize(len, 0);
-                mpi_data.b_mods[k].resize(len, 0);
-                mpi_data.res_mods[k].resize(len, 0);
-                
-                for (int j = 0; j < n_; ++j) 
-                {
-                    mpi_data.a_mods[k][j] = a_1[j] % mods[k];
-                    mpi_data.b_mods[k][j] = b_1[j] % mods[k];
-                }
-            }
-            
-            // 每个进程处理分配给它的模数
-            process_mods_in_process(mpi_data);
-            
-            // 收集所有进程的结果到rank 0
-            if (rank == 0) 
-            {
-                // 接收其他进程的结果
-                for (int src = 1; src < size; ++src) 
-                {
-                    int src_start = src * mods_per_process;
-                    int src_end = std::min(src_start + mods_per_process, total_mods);
-                    
-                    for (int k = src_start; k < src_end; ++k) 
-                    {
-                        MPI_Recv(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, src, k, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                        int start = t * chunk_size;
+                        int end = std::min(start + chunk_size, len);
+                        mul_args[t] = ModMulTaskArgs{&a_temp, &b_temp, &c, start, end, &b_ctx};
+
+                        global_thread_pool->enqueue([t, &mul_args]() {
+                            ModMul_worker(&mul_args[t]);
+                        });
                     }
+
+                    global_thread_pool->waitForAll();
+                    NTT_iterative(c, len, p_, -1, b_ctx);
                 }
-            }
+            } 
             else 
             {
-                // 发送结果到rank 0
-                for (int k = start_mod_idx; k < end_mod_idx; ++k) 
+                CRTPrecomputed pre = crt_precompute(mods);
+
+                MPICRTData mpi_data;
+                mpi_data.mods = mods;
+                mpi_data.len = len;
+                mpi_data.start_mod_idx = start_mod_idx;
+                mpi_data.end_mod_idx = end_mod_idx;
+
+                for (int k = 0; k < total_mods; ++k) 
                 {
-                    MPI_Send(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, 0, k, MPI_COMM_WORLD);
+                    mpi_data.barrett_instances.emplace_back(mods[k]);
+                }
+
+                mpi_data.a_mods.resize(total_mods);
+                mpi_data.b_mods.resize(total_mods);
+                mpi_data.res_mods.resize(total_mods);
+                
+                for (int k = 0; k < total_mods; ++k) 
+                {
+                    mpi_data.a_mods[k].assign(len, 0);
+                    mpi_data.b_mods[k].assign(len, 0);
+                    mpi_data.res_mods[k].assign(len, 0);
+                    for (int j = 0; j < n_; ++j) 
+                    {
+                        mpi_data.a_mods[k][j] = a_1[j] % mods[k];
+                        mpi_data.b_mods[k][j] = b_1[j] % mods[k];
+                    }
+                }
+
+                process_mods_in_process(mpi_data);
+
+                if (rank == 0) 
+                {
+                    for (int src = 1; src < size; ++src) 
+                    {
+                        int src_start = src * mods_per_process;
+                        int src_end = std::min(src_start + mods_per_process, total_mods);
+
+                        for (int k = src_start; k < src_end; ++k) 
+                        {
+                            MPI_Recv(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, src, k, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                        }
+                    }
+                } 
+                else 
+                {
+                    for (int k = start_mod_idx; k < end_mod_idx; ++k) 
+                    {
+                        MPI_Send(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, 0, k, MPI_COMM_WORLD);
+                    }
+                }
+
+                if (rank == 0) 
+                {
+                    CRT_combine_parallel(c, mpi_data.res_mods, mods, pre, p_, len);
                 }
             }
-            
-            // 只有rank 0进行CRT合并
-            if (rank == 0) 
-            {
-                CRT_combine_parallel(c, mpi_data.res_mods, mods, pre, p_, len);
-            }
+
+            auto End = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double, std::ratio<1,1000>> elapsed = End - Start;
+            total_time += elapsed.count();
         }
-        
+
         if (rank == 0) 
         {
-            auto End = std::chrono::high_resolution_clock::now();
-            
             for (int j = 0; j < 2 * n_ - 1; ++j) 
             {
                 ab[j] = c[j];
             }
-            
-            std::chrono::duration<double, std::ratio<1, 1000>> elapsed = End - Start;
             fCheck(ab, n_, i);
-            std::cout<<"average latency for n = "<<n_<<" p = "<<p_<<" : "<<elapsed.count()<<" (us) "<<std::endl;
-            // 可以使用 fWrite 函数将 ab 的输出结果打印到 files 文件夹下
-            // 禁止使用 cout 一次性输出大量文件内容
+            std::cout << "average latency for n = " << n_ << " p = " << p_ << " : " << (total_time / 50.0) << " (us)" << std::endl;
             fWrite(ab, n_, i);
         }
     }
