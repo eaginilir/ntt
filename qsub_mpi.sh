@@ -12,6 +12,6 @@ for node in $NODES; do
     scp -r master_ubss1:/home/${USER}/ntt/files ${node}:/home/${USER}/ 1>&2
 done
 
-/usr/local/bin/mpiexec -np 8 -machinefile $PBS_NODEFILE /home/${USER}/main
+/usr/local/bin/mpiexec -np 4 -machinefile $PBS_NODEFILE /home/${USER}/main
 
 scp -r /home/${USER}/files/ master_ubss1:/home/${USER}/ntt/ 2>&1
