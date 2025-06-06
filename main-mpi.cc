@@ -773,95 +773,64 @@ int main(int argc, char *argv[])
         for (int repeat = 0; repeat < 50; ++repeat) 
         {
             auto Start = std::chrono::high_resolution_clock::now();
+            
+            CRTPrecomputed pre = crt_precompute(mods);
 
-            if (p_ < (1ULL << 50)) 
+            MPICRTData mpi_data;
+            mpi_data.mods = mods;
+            mpi_data.len = len;
+            mpi_data.start_mod_idx = start_mod_idx;
+            mpi_data.end_mod_idx = end_mod_idx;
+
+            for (int k = 0; k < total_mods; ++k) 
             {
-                if (rank == 0) 
+                mpi_data.barrett_instances.emplace_back(mods[k]);
+            }
+
+            mpi_data.a_mods.resize(total_mods);
+            mpi_data.b_mods.resize(total_mods);
+            mpi_data.res_mods.resize(total_mods);
+            
+            for (int k = 0; k < total_mods; ++k) 
+            {
+                mpi_data.a_mods[k].assign(len, 0);
+                mpi_data.b_mods[k].assign(len, 0);
+                mpi_data.res_mods[k].assign(len, 0);
+                for (int j = 0; j < n_; ++j) 
                 {
-                    std::vector<uint64_t> a_temp = a_1, b_temp = b_1;
-                    std::fill(c.begin(), c.end(), 0);
+                    mpi_data.a_mods[k][j] = a_1[j] % mods[k];
+                    mpi_data.b_mods[k][j] = b_1[j] % mods[k];
+                }
+            }
 
-                    NTT_iterative(a_temp, len, p_, 1, b_ctx);
-                    NTT_iterative(b_temp, len, p_, 1, b_ctx);
+            process_mods_in_process(mpi_data);
 
-                    int chunk_size = (len + MAX_THREADS - 1) / MAX_THREADS;
-                    std::vector<ModMulTaskArgs> mul_args(MAX_THREADS);
-                    
-                    for (int t = 0; t < MAX_THREADS; ++t) 
+            if (rank == 0) 
+            {
+                for (int src = 1; src < size; ++src) 
+                {
+                    int src_start = src * mods_per_process;
+                    int src_end = std::min(src_start + mods_per_process, total_mods);
+
+                    for (int k = src_start; k < src_end; ++k) 
                     {
-                        int start = t * chunk_size;
-                        int end = std::min(start + chunk_size, len);
-                        mul_args[t] = ModMulTaskArgs{&a_temp, &b_temp, &c, start, end, &b_ctx};
-
-                        global_thread_pool->enqueue([t, &mul_args]() {
-                            ModMul_worker(&mul_args[t]);
-                        });
+                        MPI_Recv(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, src, k, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                     }
-
-                    global_thread_pool->waitForAll();
-                    NTT_iterative(c, len, p_, -1, b_ctx);
                 }
             } 
             else 
             {
-                CRTPrecomputed pre = crt_precompute(mods);
-
-                MPICRTData mpi_data;
-                mpi_data.mods = mods;
-                mpi_data.len = len;
-                mpi_data.start_mod_idx = start_mod_idx;
-                mpi_data.end_mod_idx = end_mod_idx;
-
-                for (int k = 0; k < total_mods; ++k) 
+                for (int k = start_mod_idx; k < end_mod_idx; ++k) 
                 {
-                    mpi_data.barrett_instances.emplace_back(mods[k]);
-                }
-
-                mpi_data.a_mods.resize(total_mods);
-                mpi_data.b_mods.resize(total_mods);
-                mpi_data.res_mods.resize(total_mods);
-                
-                for (int k = 0; k < total_mods; ++k) 
-                {
-                    mpi_data.a_mods[k].assign(len, 0);
-                    mpi_data.b_mods[k].assign(len, 0);
-                    mpi_data.res_mods[k].assign(len, 0);
-                    for (int j = 0; j < n_; ++j) 
-                    {
-                        mpi_data.a_mods[k][j] = a_1[j] % mods[k];
-                        mpi_data.b_mods[k][j] = b_1[j] % mods[k];
-                    }
-                }
-
-                process_mods_in_process(mpi_data);
-
-                if (rank == 0) 
-                {
-                    for (int src = 1; src < size; ++src) 
-                    {
-                        int src_start = src * mods_per_process;
-                        int src_end = std::min(src_start + mods_per_process, total_mods);
-
-                        for (int k = src_start; k < src_end; ++k) 
-                        {
-                            MPI_Recv(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, src, k, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                        }
-                    }
-                } 
-                else 
-                {
-                    for (int k = start_mod_idx; k < end_mod_idx; ++k) 
-                    {
-                        MPI_Send(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, 0, k, MPI_COMM_WORLD);
-                    }
-                }
-
-                if (rank == 0) 
-                {
-                    CRT_combine_parallel(c, mpi_data.res_mods, mods, pre, p_, len);
+                    MPI_Send(mpi_data.res_mods[k].data(), len * sizeof(uint64_t), MPI_BYTE, 0, k, MPI_COMM_WORLD);
                 }
             }
 
+            if (rank == 0) 
+            {
+                CRT_combine_parallel(c, mpi_data.res_mods, mods, pre, p_, len);
+            }
+        
             auto End = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double, std::ratio<1,1000>> elapsed = End - Start;
             total_time += elapsed.count();

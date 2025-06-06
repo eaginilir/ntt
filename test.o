@@ -1,13 +1,13 @@
 使用 4 个MPI进程，每个进程使用 8 个线程
 多项式乘法结果正确
-average latency for n = 4 p = 7340033 : 0.22481 (us)
+average latency for n = 4 p = 7340033 : 0.696433 (us)
 多项式乘法结果正确
-average latency for n = 131072 p = 7340033 : 41.4782 (us)
+average latency for n = 131072 p = 7340033 : 108.386 (us)
 多项式乘法结果正确
-average latency for n = 131072 p = 104857601 : 45.2686 (us)
+average latency for n = 131072 p = 104857601 : 106.766 (us)
 多项式乘法结果正确
-average latency for n = 131072 p = 469762049 : 46.2213 (us)
+average latency for n = 131072 p = 469762049 : 108.111 (us)
 多项式乘法结果正确
-average latency for n = 131072 p = 1337006139375617 : 98.1226 (us)
+average latency for n = 131072 p = 1337006139375617 : 110.161 (us)
 
 Authorized users only. All activities may be monitored and reported.
