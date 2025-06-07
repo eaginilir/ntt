@@ -391,73 +391,6 @@ void cleanup_thread_pool()
     }
 }
 
-// 内存池管理
-class MemoryPool 
-{
-private:
-    std::vector<std::vector<uint64_t>> buffers;
-    std::queue<int> available_buffers;
-    std::mutex pool_mutex;
-    int buffer_size;
-    int max_buffers;
-
-public:
-    MemoryPool(int buf_size, int max_buf) : buffer_size(buf_size), max_buffers(max_buf) 
-    {
-        for (int i = 0; i < max_buffers; ++i) 
-        {
-            buffers.emplace_back(buffer_size, 0);
-            available_buffers.push(i);
-        }
-    }
-
-    std::vector<uint64_t>* get_buffer() 
-    {
-        std::lock_guard<std::mutex> lock(pool_mutex);
-        if (available_buffers.empty()) 
-        {
-            return nullptr;
-        }
-        int idx = available_buffers.front();
-        available_buffers.pop();
-        return &buffers[idx];
-    }
-
-    void return_buffer(std::vector<uint64_t>* buffer) 
-    {
-        std::lock_guard<std::mutex> lock(pool_mutex);
-        // 找到buffer对应的索引
-        for (int i = 0; i < buffers.size(); ++i) 
-        {
-            if (&buffers[i] == buffer) 
-            {
-                available_buffers.push(i);
-                break;
-            }
-        }
-    }
-};
-
-// 全局内存池
-MemoryPool* global_memory_pool = nullptr;
-
-void init_memory_pool(int buffer_size, int max_buffers) 
-{
-    if (global_memory_pool == nullptr) 
-    {
-        global_memory_pool = new MemoryPool(buffer_size, max_buffers);
-    }
-}
-
-void cleanup_memory_pool() 
-{
-    if (global_memory_pool != nullptr) 
-    {
-        delete global_memory_pool;
-        global_memory_pool = nullptr;
-    }
-}
-
 struct ModMulTaskArgs 
 {
     const std::vector<uint64_t> *a;
@@ -774,7 +707,8 @@ int main(int argc, char *argv[])
         {
             auto Start = std::chrono::high_resolution_clock::now();
 
-            if (false) 
+            // if (p_<(1ULL<<50))
+            if(false)
             {
                 if (rank == 0) 
                 {
