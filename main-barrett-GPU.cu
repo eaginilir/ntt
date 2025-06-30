@@ -90,24 +90,22 @@ public:
     {
         // 计算 2^64 / mod
         shift_ = 64;
-        factor_ = (__uint128_t(1) << shift_) / mod_;
+        factor_ = (~0ULL) / mod_; // 等价于 floor(2^64 / mod)
     }
 
     inline uint64_t reduce(uint64_t x) const 
     {
-        return x % mod_;
-    }
-
-    inline uint64_t reduce(__uint128_t x) const 
-    {
-        uint64_t q = (uint64_t)((x * factor_) >> shift_);
-        uint64_t r = (uint64_t)x - q * mod_;
+        // Barrett Reduction: r = x - floor(x / mod) * mod
+        uint64_t q = ((uint64_t)(((unsigned __int128)x * factor_) >> 64));
+        uint64_t r = x - q * mod_;
         return r >= mod_ ? r - mod_ : r;
     }
 
     inline uint64_t multiply(uint64_t a, uint64_t b) const 
     {
-        return reduce((__uint128_t)a * b);
+        // 只用64位乘法
+        uint64_t x = a * b;
+        return reduce(x);
     }
 
     inline uint64_t add(uint64_t a, uint64_t b) const 

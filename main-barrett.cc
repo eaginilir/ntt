@@ -76,8 +76,6 @@ void poly_multiply(int *a, int *b, int *ab, int n, int p){
     }
 }
 
-//这里我们分开尝试递归和迭代写法，先从递归开始吧（这个好写）
-
 //快速幂
 uint64_t power(int base, int exp, int mod) 
 {

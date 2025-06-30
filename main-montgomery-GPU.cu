@@ -81,26 +81,71 @@ __host__ __device__ uint64_t power(uint64_t base, uint64_t exp, uint64_t mod) {
     return res;
 }
 
-// 简化的模运算结构体 - 避免Montgomery的复杂性
-struct SimpleModArith {
-    uint64_t p;
-    
-    __host__ __device__ SimpleModArith() {}
-    __host__ __device__ SimpleModArith(uint64_t p_) : p(p_) {}
-    
-    __device__ __host__ uint64_t add(uint64_t a, uint64_t b) const {
+// Montgomery模运算结构体
+struct MontgomeryModArith {
+    uint64_t p, r, r2, p_inv;
+
+    __host__ __device__ MontgomeryModArith() {}
+    __host__ __device__ MontgomeryModArith(uint64_t p_) : p(p_) {
+        r = (1ULL << 63) % p; r = (r << 1) % p; // r = 2^64 mod p
+        r2 = ((__uint128_t)r * r) % p;
+        p_inv = mont_get_pinv(p);
+    }
+
+    // 计算p的Montgomery逆元
+    __host__ __device__ static uint64_t mont_get_pinv(uint64_t p) {
+        uint64_t ret = 1;
+        for (int i = 0; i < 6; ++i) ret *= 2 - p * ret;
+        return ~ret + 1;
+    }
+
+    // 转Montgomery域
+    __host__ __device__ uint64_t to_mont(uint64_t a) const {
+        return mont_mul(a, r2);
+    }
+    // 从Montgomery域转回
+    __host__ __device__ uint64_t from_mont(uint64_t a) const {
+        return mont_reduce(a);
+    }
+    // Montgomery乘法
+    __host__ __device__ uint64_t mont_mul(uint64_t a, uint64_t b) const {
+        return mont_reduce((__uint128_t)a * b);
+    }
+    // Montgomery规约
+    __host__ __device__ uint64_t mont_reduce(__uint128_t t) const {
+        uint64_t m = uint64_t(t) * p_inv;
+        __uint128_t u = t + (__uint128_t)m * p;
+        u >>= 64;
+        if (u >= p) u -= p;
+        return (uint64_t)u;
+    }
+    // 加法
+    __host__ __device__ uint64_t add(uint64_t a, uint64_t b) const {
         uint64_t res = a + b;
         return res >= p ? res - p : res;
     }
-    
-    __device__ __host__ uint64_t sub(uint64_t a, uint64_t b) const {
+    // 减法
+    __host__ __device__ uint64_t sub(uint64_t a, uint64_t b) const {
         return a >= b ? a - b : a + p - b;
     }
-    
-    __device__ __host__ uint64_t mul(uint64_t a, uint64_t b) const {
-        return ((__uint128_t)a * b) % p;
+    // 乘法（Montgomery域）
+    __host__ __device__ uint64_t mul(uint64_t a, uint64_t b) const {
+        return mont_mul(a, b);
     }
 };
+
+// 转Montgomery域核函数
+__global__ void to_mont_kernel(uint64_t *a, int n, MontgomeryModArith mod) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    a[idx] = mod.to_mont(a[idx]);
+}
+// 从Montgomery域转回核函数
+__global__ void from_mont_kernel(uint64_t *a, int n, MontgomeryModArith mod) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    a[idx] = mod.from_mont(a[idx]);
+}
 
 // CPU版本位反转
 void bit_reverse_cpu(std::vector<uint64_t> &a, int n) {
@@ -137,98 +182,81 @@ __global__ void bit_reverse_kernel(uint64_t *a, int n) {
 
 // GPU内核 - NTT主循环
 __global__ void ntt_kernel(uint64_t *a, int n, int len, uint64_t *twiddles, 
-                          SimpleModArith mod, int twiddle_offset) {
+                          MontgomeryModArith mod, int twiddle_offset) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_butterflies = n / len;
-    
     if (idx >= total_butterflies * (len / 2)) return;
-    
     int butterfly_group = idx / (len / 2);
     int j = idx % (len / 2);
     int i = butterfly_group * len;
-    
     uint64_t w = twiddles[twiddle_offset + j];
-    
     uint64_t u = a[i + j];
     uint64_t v = mod.mul(w, a[i + j + len / 2]);
-    
     a[i + j] = mod.add(u, v);
     a[i + j + len / 2] = mod.sub(u, v);
 }
 
 // GPU内核 - 逆NTT的最终除法
-__global__ void inv_ntt_final_kernel(uint64_t *a, int n, uint64_t inv_n, SimpleModArith mod) {
+__global__ void inv_ntt_final_kernel(uint64_t *a, int n, uint64_t inv_n, MontgomeryModArith mod) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    
     a[idx] = mod.mul(a[idx], inv_n);
 }
 
 // GPU内核 - 向量乘法
 __global__ void pointwise_mul_kernel(uint64_t *c, const uint64_t *a, const uint64_t *b, 
-                                   int n, SimpleModArith mod) {
+                                   int n, MontgomeryModArith mod) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    
     c[idx] = mod.mul(a[idx], b[idx]);
 }
 
 class CudaNTT {
 private:
-    SimpleModArith mod;
+    MontgomeryModArith mod;
     uint64_t *d_twiddles;
     int max_n;
     uint64_t p;
-    
 public:
     CudaNTT(uint64_t p_, int max_n_) : p(p_), max_n(max_n_) {
-        mod = SimpleModArith(p_);
+        mod = MontgomeryModArith(p_);
         d_twiddles = nullptr;
-        
-        // 预计算所有旋转因子
         precompute_twiddles();
     }
-    
     ~CudaNTT() {
         if (d_twiddles) {
             CUDA_CHECK(cudaFree(d_twiddles));
         }
     }
-    
 private:
     void precompute_twiddles() {
         int g = 3; // 原根
         std::vector<uint64_t> twiddles;
-        
-        // 为每个长度预计算正向变换的旋转因子
+        // 为每个长度预计算正向变换的旋转因子（Montgomery域）
         for (int len = 2; len <= max_n; len <<= 1) {
             uint64_t wn = power(g, (p - 1) / len, p);
-            uint64_t w = 1;
-            
+            wn = mod.to_mont(wn);
+            uint64_t w = mod.to_mont(1);
             for (int j = 0; j < len / 2; ++j) {
                 twiddles.push_back(w);
-                w = ((__uint128_t)w * wn) % p;
+                w = mod.mul(w, wn);
             }
         }
-        
-        // 逆变换的旋转因子
+        // 逆变换的旋转因子（Montgomery域）
         for (int len = 2; len <= max_n; len <<= 1) {
             uint64_t wn = power(g, (p - 1) / len, p);
             wn = power(wn, p - 2, p); // 逆元
-            uint64_t w = 1;
-            
+            wn = mod.to_mont(wn);
+            uint64_t w = mod.to_mont(1);
             for (int j = 0; j < len / 2; ++j) {
                 twiddles.push_back(w);
-                w = ((__uint128_t)w * wn) % p;
+                w = mod.mul(w, wn);
             }
         }
-        
-        // 复制到GPU
         CUDA_CHECK(cudaMalloc(&d_twiddles, twiddles.size() * sizeof(uint64_t)));
         CUDA_CHECK(cudaMemcpy(d_twiddles, twiddles.data(), 
                              twiddles.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
     }
-    
     int get_twiddle_offset(int len, bool inverse) {
         int offset = 0;
         for (int l = 2; l < len; l <<= 1) {
@@ -244,7 +272,6 @@ private:
         }
         return offset;
     }
-    
 public:
     void ntt_gpu(uint64_t *d_a, int n, bool inverse) {
         // 获取GPU属性来优化块大小
@@ -253,73 +280,64 @@ public:
         
         int blockSize = std::min(1024, prop.maxThreadsPerBlock);
         int gridSize;
-        
+
         // 位反转
         gridSize = (n + blockSize - 1) / blockSize;
         bit_reverse_kernel<<<gridSize, blockSize>>>(d_a, n);
         CUDA_CHECK(cudaDeviceSynchronize());
-        
+
         // NTT主循环
         for (int len = 2; len <= n; len <<= 1) {
             int total_ops = n / len * (len / 2);
             gridSize = (total_ops + blockSize - 1) / blockSize;
-            
             int twiddle_offset = get_twiddle_offset(len, inverse);
-            
             ntt_kernel<<<gridSize, blockSize>>>(d_a, n, len, d_twiddles, mod, twiddle_offset);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
-        
-        // 逆变换的最终除法
+
+        // 逆NTT的最终除法
         if (inverse) {
             uint64_t inv_n = power(n, p - 2, p);
-            
+            inv_n = mod.to_mont(inv_n);
             gridSize = (n + blockSize - 1) / blockSize;
             inv_ntt_final_kernel<<<gridSize, blockSize>>>(d_a, n, inv_n, mod);
             CUDA_CHECK(cudaDeviceSynchronize());
+            // 逆NTT后再转回普通域
+            from_mont_kernel<<<gridSize, blockSize>>>(d_a, n, mod);
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
     }
-    
+
     void polynomial_multiply(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b,
                            std::vector<uint64_t> &result, int n) {
         int len = 1;
         while (len < 2 * n) len <<= 1;
-        
         result.resize(len);
-        
-        // 分配GPU内存
         uint64_t *d_a, *d_b, *d_c;
         CUDA_CHECK(cudaMalloc(&d_a, len * sizeof(uint64_t)));
         CUDA_CHECK(cudaMalloc(&d_b, len * sizeof(uint64_t)));
         CUDA_CHECK(cudaMalloc(&d_c, len * sizeof(uint64_t)));
-        
-        // 复制数据到GPU并零填充
         CUDA_CHECK(cudaMemset(d_a, 0, len * sizeof(uint64_t)));
         CUDA_CHECK(cudaMemset(d_b, 0, len * sizeof(uint64_t)));
         CUDA_CHECK(cudaMemcpy(d_a, a.data(), n * sizeof(uint64_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_b, b.data(), n * sizeof(uint64_t), cudaMemcpyHostToDevice));
-        
-        // 获取GPU属性
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
         int blockSize = std::min(1024, prop.maxThreadsPerBlock);
         int gridSize = (len + blockSize - 1) / blockSize;
-        
-        // 前向NTT
+
+        // 只在这里转一次Montgomery域
+        to_mont_kernel<<<gridSize, blockSize>>>(d_a, len, mod);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        to_mont_kernel<<<gridSize, blockSize>>>(d_b, len, mod);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
         ntt_gpu(d_a, len, false);
         ntt_gpu(d_b, len, false);
-        
-        // 点乘
         pointwise_mul_kernel<<<gridSize, blockSize>>>(d_c, d_a, d_b, len, mod);
         CUDA_CHECK(cudaDeviceSynchronize());
-        
-        // 逆NTT
         ntt_gpu(d_c, len, true);
-        
-        // 复制结果回CPU
         CUDA_CHECK(cudaMemcpy(result.data(), d_c, len * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-        
-        // 清理GPU内存
         CUDA_CHECK(cudaFree(d_a));
         CUDA_CHECK(cudaFree(d_b));
         CUDA_CHECK(cudaFree(d_c));
