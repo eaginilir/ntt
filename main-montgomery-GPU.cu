@@ -11,7 +11,6 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include "montgomery.h"
 
 #define CUDA_CHECK(call) \
     do { \
@@ -70,72 +69,124 @@ void fWrite(int *ab, int n, int input_id)
     }
 }
 
-// // CPU版本的快速幂
-// __host__ __device__ uint64_t power(uint64_t base, uint64_t exp, uint64_t mod) {
-//     uint64_t res = 1;
-//     base %= mod;
-//     while (exp > 0) {
-//         if (exp & 1) {
-//             res = ((__uint128_t)res * base) % mod;
-//         }
-//         base = ((__uint128_t)base * base) % mod;
-//         exp >>= 1;
-//     }
-//     return res;
-// }
+struct __uint128_t {
+    uint64_t lo;
+    uint64_t hi;
 
-// // Montgomery模运算结构体
-// struct MontgomeryModArith {
-//     uint64_t p, r, r2, p_inv;
+    __host__ __device__ __uint128_t() : lo(0), hi(0) {}
+    __host__ __device__ __uint128_t(uint64_t low) : lo(low), hi(0) {}
+    __host__ __device__ __uint128_t(uint64_t high, uint64_t low) : lo(low), hi(high) {}
 
-//     __host__ __device__ MontgomeryModArith() {}
-//     __host__ __device__ MontgomeryModArith(uint64_t p_) : p(p_) {
-//         r = (1ULL << 63) % p; r = (r << 1) % p; // r = 2^64 mod p
-//         r2 = ((__uint128_t)r * r) % p;
-//         p_inv = mont_get_pinv(p);
-//     }
+    // 乘法：u = a * b
+    __host__ __device__ static __uint128_t mul(uint64_t a, uint64_t b) {
+        uint64_t a_lo = (uint32_t)a;
+        uint64_t a_hi = a >> 32;
+        uint64_t b_lo = (uint32_t)b;
+        uint64_t b_hi = b >> 32;
 
-//     // 计算p的Montgomery逆元
-//     __host__ __device__ static uint64_t mont_get_pinv(uint64_t p) {
-//         uint64_t ret = 1;
-//         for (int i = 0; i < 6; ++i) ret *= 2 - p * ret;
-//         return ~ret + 1;
-//     }
+        uint64_t lo_lo = a_lo * b_lo;
+        uint64_t hi_lo = a_hi * b_lo;
+        uint64_t lo_hi = a_lo * b_hi;
+        uint64_t hi_hi = a_hi * b_hi;
 
-//     // 转Montgomery域
-//     __host__ __device__ uint64_t to_mont(uint64_t a) const {
-//         return mont_mul(a, r2);
-//     }
-//     // 从Montgomery域转回
-//     __host__ __device__ uint64_t from_mont(uint64_t a) const {
-//         return mont_reduce(a);
-//     }
-//     // Montgomery乘法
-//     __host__ __device__ uint64_t mont_mul(uint64_t a, uint64_t b) const {
-//         return mont_reduce((__uint128_t)a * b);
-//     }
-//     // Montgomery规约
-//     __host__ __device__ uint64_t mont_reduce(__uint128_t t) const {
-//         uint64_t m = uint64_t(t) * p_inv;
-//         __uint128_t u = t + (__uint128_t)m * p;
-//         u >>= 64;
-//         if (u >= p) u -= p;
-//         return (uint64_t)u;
-//     }
-//     // 加法
-//     __host__ __device__ uint64_t add(uint64_t a, uint64_t b) const {
-//         uint64_t res = a + b;
-//         return res >= p ? res - p : res;
-//     }
-//     // 减法
-//     __host__ __device__ uint64_t sub(uint64_t a, uint64_t b) const {
-//         return a >= b ? a - b : a + p - b;
-//     }
-//     // 乘法（Montgomery域）
-//     __host__ __device__ uint64_t mul(uint64_t a, uint64_t b) const {
-//         return mont_mul(a, b);
-//     }
-// };
+        uint64_t mid1 = (lo_lo >> 32) + (hi_lo & 0xFFFFFFFF) + (lo_hi & 0xFFFFFFFF);
+        uint64_t mid2 = (hi_lo >> 32) + (lo_hi >> 32) + (mid1 >> 32);
+
+        uint64_t low = (lo_lo & 0xFFFFFFFF) | (mid1 << 32);
+        uint64_t high = hi_hi + (mid2);
+
+        return __uint128_t(high, low);
+    }
+
+    // 128位对64位取模（仅适用于hi < mod）
+    __host__ __device__ uint64_t mod(uint64_t mod) const {
+        // 只适用于hi < mod的情况
+        uint64_t rem = hi % mod;
+        // (hi * 2^64 + lo) % mod = ((hi % mod) * (2^64 % mod) + lo % mod) % mod
+        uint64_t base = ((~(uint64_t)0) % mod) + 1; // 2^64 % mod
+        rem = (rem * base) % mod;
+        rem = (rem + (lo % mod)) % mod;
+        return rem;
+    }
+
+    __host__ __device__ uint64_t to_uint64() const {
+        return lo;
+    }
+};
+
+
+// CPU版本的快速幂
+__host__ __device__ uint64_t power(uint64_t base, uint64_t exp, uint64_t mod) {
+    uint64_t res = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1) {
+            res = __uint128_t::mul(res, base).mod(mod);
+        }
+        base = __uint128_t::mul(base, base).mod(mod);
+        exp >>= 1;
+    }
+    return res;
+}
+
+// Montgomery模运算结构体
+struct MontgomeryModArith {
+    uint64_t p, r, r2, p_inv;
+
+    __host__ __device__ MontgomeryModArith() {}
+    __host__ __device__ MontgomeryModArith(uint64_t p_) : p(p_) {
+        r = (1ULL << 63) % p; r = (r << 1) % p; // r = 2^64 mod p
+        r2 = __uint128_t::mul(r, r).mod(p);
+        p_inv = mont_get_pinv(p);
+    }
+
+    // 计算p的Montgomery逆元
+    __host__ __device__ static uint64_t mont_get_pinv(uint64_t p) {
+        uint64_t ret = 1;
+        for (int i = 0; i < 6; ++i) ret *= 2 - p * ret;
+        return ~ret + 1;
+    }
+
+    // 转Montgomery域
+    __host__ __device__ uint64_t to_mont(uint64_t a) const {
+        return mont_mul(a, r2);
+    }
+    // 从Montgomery域转回
+    __host__ __device__ uint64_t from_mont(uint64_t a) const {
+        return mont_reduce(__uint128_t(0, a));
+    }
+    // Montgomery乘法
+    __host__ __device__ uint64_t mont_mul(uint64_t a, uint64_t b) const {
+        return mont_reduce(__uint128_t::mul(a, b));
+    }
+    // Montgomery规约
+    __host__ __device__ uint64_t mont_reduce(__uint128_t t) const {
+        uint64_t m = t.lo * p_inv;
+        __uint128_t mp = __uint128_t::mul(m, p);
+        uint64_t t_hi = t.hi;
+        uint64_t t_lo = t.lo;
+        uint64_t u_lo = t_lo + mp.lo;
+        uint64_t carry = (u_lo < t_lo) ? 1 : 0;
+        uint64_t u_hi = t_hi + mp.hi + carry;
+        // 右移64位
+        uint64_t res = u_hi;
+        if (res >= p) res -= p;
+        return res;
+    }
+    // 加法
+    __host__ __device__ uint64_t add(uint64_t a, uint64_t b) const {
+        uint64_t res = a + b;
+        return res >= p ? res - p : res;
+    }
+    // 减法
+    __host__ __device__ uint64_t sub(uint64_t a, uint64_t b) const {
+        return a >= b ? a - b : a + p - b;
+    }
+    // 乘法（Montgomery域）
+    __host__ __device__ uint64_t mul(uint64_t a, uint64_t b) const {
+        return mont_mul(a, b);
+    }
+};
 
 // 转Montgomery域核函数
 __global__ void to_mont_kernel(uint64_t *a, int n, MontgomeryModArith mod) {

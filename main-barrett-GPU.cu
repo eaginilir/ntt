@@ -4,13 +4,21 @@
 #include <fstream>
 #include <chrono>
 #include <iomanip>
-#include <sys/time.h>
 #include <omp.h>
 #include <algorithm>
 #include <cmath>
 #include <vector>
 #include <cuda_runtime.h>
-// 可以自行添加需要的头文件
+#include <device_launch_parameters.h>
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t error = call; \
+        if (error != cudaSuccess) { \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " << cudaGetErrorString(error) << std::endl; \
+            exit(1); \
+        } \
+    } while(0)
 
 
 void fRead(int *a, int *b, int *n, int *p, int input_id)
@@ -40,11 +48,13 @@ void fCheck(int *ab, int n, int input_id)
         fin>>x;
         if(x != ab[i])
         {
-            std::cout<<"多项式乘法结果错误"<<std::endl;
+            // std::cout<<"多项式乘法结果错误"<<std::endl;
+            std::cout<<"wrong"<<std::endl;
             return;
         }
     }
-    std::cout<<"多项式乘法结果正确"<<std::endl;
+    // std::cout<<"多项式乘法结果正确"<<std::endl;
+    std::cout<<"right"<<std::endl;
     return;
 }
 
@@ -59,258 +69,313 @@ void fWrite(int *ab, int n, int input_id)
     }
 }
 
-void poly_multiply(int *a, int *b, int *ab, int n, int p){
-    for(int i = 0; i < n; ++i){
-        for(int j = 0; j < n; ++j){
-            ab[i+j]=(1LL * a[i] * b[j] % p + ab[i+j]) % p;
-        }
-    }
-}
+struct __uint128_t {
+    uint64_t lo;
+    uint64_t hi;
 
-//快速幂
-uint64_t power(int base, int exp, int mod) 
-{
+    __host__ __device__ __uint128_t() : lo(0), hi(0) {}
+    __host__ __device__ __uint128_t(uint64_t low) : lo(low), hi(0) {}
+    __host__ __device__ __uint128_t(uint64_t high, uint64_t low) : lo(low), hi(high) {}
+
+    // 乘法：u = a * b（结果为128位）
+    __host__ __device__ static __uint128_t mul(uint64_t a, uint64_t b) {
+        uint64_t a_lo = (uint32_t)a;
+        uint64_t a_hi = a >> 32;
+        uint64_t b_lo = (uint32_t)b;
+        uint64_t b_hi = b >> 32;
+
+        uint64_t lo_lo = a_lo * b_lo;
+        uint64_t hi_lo = a_hi * b_lo;
+        uint64_t lo_hi = a_lo * b_hi;
+        uint64_t hi_hi = a_hi * b_hi;
+
+        uint64_t mid1 = (lo_lo >> 32) + (hi_lo & 0xFFFFFFFF) + (lo_hi & 0xFFFFFFFF);
+        uint64_t mid2 = (hi_lo >> 32) + (lo_hi >> 32) + (mid1 >> 32);
+
+        uint64_t low = (lo_lo & 0xFFFFFFFF) | (mid1 << 32);
+        uint64_t high = hi_hi + mid2;
+
+        return __uint128_t(high, low);
+    }
+
+    // 对模m进行取模（要求hi < mod）
+    __host__ __device__ uint64_t mod(uint64_t mod) const {
+        // 2^64 % mod = (~0ULL % mod) + 1
+        uint64_t base = ((~(uint64_t)0) % mod) + 1;
+        uint64_t rem = (hi % mod) * base % mod;
+        rem = (rem + (lo % mod)) % mod;
+        return rem;
+    }
+
+    // 提取低64位
+    __host__ __device__ uint64_t to_uint64() const {
+        return lo;
+    }
+};
+
+// CPU快速幂
+__host__ __device__ uint64_t power(uint64_t base, uint64_t exp, uint64_t mod) {
     uint64_t res = 1;
-    while (exp > 0) 
-    {
-        if (exp & 1) 
-        {
-            res = 1LL * res * base % mod;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1) {
+            res = __uint128_t::mul(res, base).mod(mod);
         }
-        base = 1LL * base * base % mod;
+        base = __uint128_t::mul(base, base).mod(mod);
         exp >>= 1;
     }
     return res;
 }
 
-class Barrett 
-{
-public:
-    Barrett(uint64_t mod): mod_(mod) 
-    {
-        // 计算 2^64 / mod
-        shift_ = 64;
-        factor_ = (__uint128_t(1) << shift_) / mod_;
+// Barrett结构体
+struct Barrett {
+    uint64_t mod;
+    uint64_t factor;
+    __host__ __device__ Barrett() {}
+    __host__ __device__ Barrett(uint64_t m) : mod(m) {
+        // factor = floor(2^64 / m)
+        factor = (~0ULL) / m;
     }
-
-    inline uint64_t reduce(uint64_t x) const 
-    {
-        return x % mod_;
+    // x 为 64 位，返回 x % mod
+    __host__ __device__ inline uint64_t reduce(uint64_t x) const {
+        // q = floor(x * factor / 2^64)
+        __uint128_t q = __uint128_t::mul(x, factor);
+        uint64_t q1 = q.hi;
+        uint64_t r = x - q1 * mod;
+        if (r >= mod) r -= mod;
+        return r;
     }
-
-    inline uint64_t reduce(__uint128_t x) const 
-    {
-        uint64_t q = (uint64_t)((x * factor_) >> shift_);
-        uint64_t r = (uint64_t)x - q * mod_;
-        return r >= mod_ ? r - mod_ : r;
+    // 128位乘法后直接取模
+    __host__ __device__ inline uint64_t reduce128(const __uint128_t& x) const {
+        // x.hi < mod 保证安全
+        return x.mod(mod);
     }
-
-    inline uint64_t multiply(uint64_t a, uint64_t b) const 
-    {
-        return reduce((__uint128_t)a * b);
+    __host__ __device__ inline uint64_t mul(uint64_t a, uint64_t b) const {
+        return reduce128(__uint128_t::mul(a, b));
     }
-
-    inline uint64_t add(uint64_t a, uint64_t b) const 
-    {
+    __host__ __device__ inline uint64_t add(uint64_t a, uint64_t b) const {
         uint64_t r = a + b;
-        return r >= mod_ ? r - mod_ : r;
+        return r >= mod ? r - mod : r;
     }
-
-    inline uint64_t sub(uint64_t a, uint64_t b) const 
-    {
-        return a >= b ? a - b : mod_ - (b - a);
+    __host__ __device__ inline uint64_t sub(uint64_t a, uint64_t b) const {
+        return a >= b ? a - b : a + mod - b;
     }
-
-private:
-    uint64_t mod_;
-    int shift_;
-    uint64_t factor_;
 };
 
-void bit_reverse(std::vector<uint64_t> &a,int n)
-{
-    for(int i = 1, j = 0; i < n;++i) 
-    {
-        int bit = n >> 1;
-        for(; j >= bit;bit>>=1) 
-        {
-            j -= bit;
-        }
-        j += bit;
-        if(i<j)
-        {
-            std::swap(a[i], a[j]);
-        }
+// GPU内核 - 位反转
+__global__ void bit_reverse_kernel(uint64_t *a, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int j = 0, t = idx;
+    for (int bit = n >> 1; bit > 0; bit >>= 1) {
+        j = (j << 1) | (t & 1);
+        t >>= 1;
+    }
+    if (idx < j) {
+        uint64_t tmp = a[idx];
+        a[idx] = a[j];
+        a[j] = tmp;
     }
 }
 
-// 修改NTT实现使用Barrett规约
-void NTT_iterative(std::vector<uint64_t> &a, int n, int p, int inv, Barrett &barrett) 
-{
-    int g = 3; //原根
-    bit_reverse(a, n);
+// GPU内核 - NTT主循环
+__global__ void ntt_kernel(uint64_t *a, int n, int len, const uint64_t *twiddles, Barrett barrett, int twiddle_offset) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_butterflies = n / len;
+    if (idx >= total_butterflies * (len / 2)) return;
+    int butterfly_group = idx / (len / 2);
+    int j = idx % (len / 2);
+    int i = butterfly_group * len;
+    uint64_t w = twiddles[twiddle_offset + j];
+    uint64_t u = a[i + j];
+    uint64_t v = barrett.mul(w, a[i + j + len / 2]);
+    a[i + j] = barrett.add(u, v);
+    a[i + j + len / 2] = barrett.sub(u, v);
+}
 
-    for(int len = 2; len <= n; len <<= 1) 
-    {
-        int wn = power(g, (p - 1) / len, p);
-        if(inv == -1) 
-        {
-            wn = power(wn, p - 2, p);
+// GPU内核 - 逆NTT的最终除法
+__global__ void inv_ntt_final_kernel(uint64_t *a, int n, uint64_t inv_n, Barrett barrett) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    a[idx] = barrett.mul(a[idx], inv_n);
+}
+
+// GPU内核 - 向量乘法
+__global__ void pointwise_mul_kernel(uint64_t *c, const uint64_t *a, const uint64_t *b, int n, Barrett barrett) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    c[idx] = barrett.mul(a[idx], b[idx]);
+}
+
+class CudaBarrettNTT {
+private:
+    Barrett barrett;
+    uint64_t *d_twiddles;
+    int max_n;
+    uint64_t p;
+public:
+    CudaBarrettNTT(uint64_t p_, int max_n_) : p(p_), max_n(max_n_) {
+        barrett = Barrett(p_);
+        d_twiddles = nullptr;
+        precompute_twiddles();
+    }
+    ~CudaBarrettNTT() {
+        if (d_twiddles) {
+            CUDA_CHECK(cudaFree(d_twiddles));
         }
-
-        for(int i = 0; i < n; i += len) 
-        {
+    }
+private:
+    void precompute_twiddles() {
+        int g = 3;
+        std::vector<uint64_t> twiddles;
+        // 正向
+        for (int len = 2; len <= max_n; len <<= 1) {
+            uint64_t wn = power(g, (p - 1) / len, p);
             uint64_t w = 1;
-            for(int j = 0; j < len/2; ++j) 
-            {
-                uint64_t u = a[i + j];
-                uint64_t v = barrett.multiply(w, a[i + j + len/2]);
-                a[i + j] = barrett.add(u, v);
-                a[i + j + len/2] = barrett.sub(u, v);
-                w = barrett.multiply(w, wn);
+            for (int j = 0; j < len / 2; ++j) {
+                twiddles.push_back(w);
+                w = __uint128_t::mul(w, wn).mod(p);
             }
         }
+        // 逆向
+        for (int len = 2; len <= max_n; len <<= 1) {
+            uint64_t wn = power(g, (p - 1) / len, p);
+            wn = power(wn, p - 2, p);
+            uint64_t w = 1;
+            for (int j = 0; j < len / 2; ++j) {
+                twiddles.push_back(w);
+                w = __uint128_t::mul(w, wn).mod(p);
+            }
+        }
+        CUDA_CHECK(cudaMalloc(&d_twiddles, twiddles.size() * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpy(d_twiddles, twiddles.data(), twiddles.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
     }
+    int get_twiddle_offset(int len, bool inverse) {
+        int offset = 0;
+        for (int l = 2; l < len; l <<= 1) {
+            offset += l / 2;
+        }
+        if (inverse) {
+            int forward_total = 0;
+            for (int l = 2; l <= max_n; l <<= 1) {
+                forward_total += l / 2;
+            }
+            offset += forward_total;
+        }
+        return offset;
+    }
+public:
+    void ntt_gpu(uint64_t *d_a, int n, bool inverse) {
+        cudaDeviceProp prop;
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+        int blockSize = std::min(1024, prop.maxThreadsPerBlock);
+        int gridSize;
 
-    if(inv == -1) 
-    {
-        int inv_n = power(n, p - 2, p);
-        for(uint64_t &x : a) 
-        {
-            x = barrett.multiply(x, inv_n);
+        // 位反转
+        gridSize = (n + blockSize - 1) / blockSize;
+        bit_reverse_kernel<<<gridSize, blockSize>>>(d_a, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // NTT主循环
+        for (int len = 2; len <= n; len <<= 1) {
+            int total_ops = n / len * (len / 2);
+            gridSize = (total_ops + blockSize - 1) / blockSize;
+            int twiddle_offset = get_twiddle_offset(len, inverse);
+            ntt_kernel<<<gridSize, blockSize>>>(d_a, n, len, d_twiddles, barrett, twiddle_offset);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // 逆NTT的最终除法
+        if (inverse) {
+            uint64_t inv_n = power(n, p - 2, p);
+            gridSize = (n + blockSize - 1) / blockSize;
+            inv_ntt_final_kernel<<<gridSize, blockSize>>>(d_a, n, inv_n, barrett);
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
     }
-}
 
-__device__ __forceinline__ uint64_t barrett_reduce(uint64_t x, uint64_t mod) {
-    return x >= mod ? x - mod : x;
-}
+    void polynomial_multiply(const std::vector<uint64_t> &a, const std::vector<uint64_t> &b,
+                           std::vector<uint64_t> &result, int n) {
+        int len = 1;
+        while (len < 2 * n) len <<= 1;
+        result.resize(len);
+        uint64_t *d_a, *d_b, *d_c;
+        CUDA_CHECK(cudaMalloc(&d_a, len * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_b, len * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_c, len * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(d_a, 0, len * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(d_b, 0, len * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpy(d_a, a.data(), n * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_b, b.data(), n * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        cudaDeviceProp prop;
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+        int blockSize = std::min(1024, prop.maxThreadsPerBlock);
+        int gridSize = (len + blockSize - 1) / blockSize;
 
-__global__ void ntt_layer_kernel(uint64_t *a, int n, int len, const uint64_t *wlen, uint64_t mod) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n / len * (len / 2);
-    if (tid >= total) return;
-    int group = tid / (len / 2);
-    int j = tid % (len / 2);
-    int i = group * len;
-    uint64_t w = wlen[j];
-    uint64_t u = a[i + j];
-    uint64_t v = (__uint128_t(w) * a[i + j + len/2]) % mod;
-    uint64_t t = u + v;
-    a[i + j] = t >= mod ? t - mod : t;
-    t = u >= v ? u - v : mod - (v - u);
-    a[i + j + len/2] = t;
-}
-
-void prepare_wlen(std::vector<std::vector<uint64_t>> &wlen_all, int n, int p, int inv) {
-    int g = 3;
-    for (int len = 2; len <= n; len <<= 1) {
-        int wn = power(g, (p - 1) / len, p);
-        if (inv == -1) wn = power(wn, p - 2, p);
-        std::vector<uint64_t> wlen(len / 2, 1);
-        for (int j = 1; j < len / 2; ++j) {
-            wlen[j] = (uint64_t(wlen[j - 1]) * wn) % p;
-        }
-        wlen_all.push_back(wlen);
+        ntt_gpu(d_a, len, false);
+        ntt_gpu(d_b, len, false);
+        pointwise_mul_kernel<<<gridSize, blockSize>>>(d_c, d_a, d_b, len, barrett);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ntt_gpu(d_c, len, true);
+        CUDA_CHECK(cudaMemcpy(result.data(), d_c, len * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(d_a));
+        CUDA_CHECK(cudaFree(d_b));
+        CUDA_CHECK(cudaFree(d_c));
     }
-}
+};
 
-// GPU NTT实现（修正同步与规约）
-void NTT_iterative_GPU(std::vector<uint64_t> &a, int n, int p, int inv, Barrett &barrett) {
-    std::vector<std::vector<uint64_t>> wlen_all;
-    prepare_wlen(wlen_all, n, p, inv);
+int a[300000], b[300000], ab[300000];
 
-    bit_reverse(a, n);
-
-    uint64_t mod = p;
-
-    uint64_t *d_a;
-    cudaMalloc(&d_a, n * sizeof(uint64_t));
-    cudaMemcpy(d_a, a.data(), n * sizeof(uint64_t), cudaMemcpyHostToDevice);
-
-    int layer = 0;
-    for (int len = 2; len <= n; len <<= 1, ++layer) {
-        uint64_t *d_wlen;
-        cudaMalloc(&d_wlen, (len/2) * sizeof(uint64_t));
-        cudaMemcpy(d_wlen, wlen_all[layer].data(), (len/2) * sizeof(uint64_t), cudaMemcpyHostToDevice);
-
-        int total = n / len * (len / 2);
-        int block = 256;
-        int grid = (total + block - 1) / block;
-        ntt_layer_kernel<<<grid, block>>>(d_a, n, len, d_wlen, mod);
-        cudaDeviceSynchronize();
-        cudaFree(d_wlen);
+int main(int argc, char *argv[]) {
+    int deviceCount;
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    if (deviceCount == 0) {
+        std::cerr << "No CUDA devices found!" << std::endl;
+        return 1;
     }
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    std::cout << "Using GPU: " << prop.name << std::endl;
+    std::cout << "SM count: " << prop.multiProcessorCount << std::endl;
+    std::cout << "Max threads per block: " << prop.maxThreadsPerBlock << std::endl;
+    std::cout << "Max threads per SM: " << prop.maxThreadsPerMultiProcessor << std::endl;
 
-    cudaMemcpy(a.data(), d_a, n * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_a);
-
-    if (inv == -1) {
-        int inv_n = power(n, p - 2, p);
-        for (uint64_t &x : a) {
-            x = barrett.multiply(x, inv_n);
-        }
-    }
-}
-
-int a[300000],b[300000], ab[300000];
-int main(int argc, char *argv[])
-{
-
-    // 保证输入的所有模数的原根均为 3, 且模数都能表示为 a \times 4 ^ k + 1 的形式
-    // 输入模数分别为 7340033 104857601 469762049 263882790666241
-    // 第四个模数超过了整型表示范围, 如果实现此模数意义下的多项式乘法需要修改框架
-    // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
-    // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
-    // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
     int test_begin = 0;
     int test_end = 4;
-    for(int i = test_begin; i <= test_end; ++i)
-    {
+    for(int i = test_begin; i <= test_end; ++i) {
         long double ans = 0;
         int n_, p_;
         fRead(a, b, &n_, &p_, i);
         memset(ab, 0, sizeof(ab));
-        Barrett barrett(p_);
+        std::cout << "Processing test case " << i << " with n=" << n_ << ", p=" << p_ << std::endl;
         int len = 1;
-        while(len < 2*n_) 
-        {
-            len <<= 1;
+        while(len < 2 * n_) len <<= 1;
+        CudaBarrettNTT* cuda_ntt = nullptr;
+        try {
+            cuda_ntt = new CudaBarrettNTT(p_, len);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to create CUDA Barrett NTT for p=" << p_ << ": " << e.what() << std::endl;
+            continue;
         }
-
         int epochs = 50;
-        for (int i = 0; i < epochs; ++i) 
-        {
-            std::vector<uint64_t> a_1(len, 0);
-            std::vector<uint64_t> b_1(len, 0);
-            for (int i = 0; i < n_; ++i) 
-            {
-                a_1[i] = a[i];
-                b_1[i] = b[i];
+        for (int epoch = 0; epoch < epochs; ++epoch) {
+            std::vector<uint64_t> a_vec(n_), b_vec(n_), result;
+            for (int j = 0; j < n_; ++j) {
+                a_vec[j] = a[j];
+                b_vec[j] = b[j];
             }
-            
             auto Start = std::chrono::high_resolution_clock::now();
-            NTT_iterative_GPU(a_1, len, p_, 1, barrett);
-            NTT_iterative_GPU(b_1, len, p_, 1, barrett);
-            
-            std::vector<uint64_t> c(len, 0);
-            for (int i = 0; i < len; ++i) 
-            {
-                c[i] = barrett.multiply(a_1[i], b_1[i]);
-            }
-            
-            NTT_iterative_GPU(c, len, p_, -1, barrett);
+            cuda_ntt->polynomial_multiply(a_vec, b_vec, result, n_);
             auto End = std::chrono::high_resolution_clock::now();
-            
-            for (int i = 0; i < 2 * n_ - 1; ++i) 
-            {
-                ab[i] = c[i];
+            for (int j = 0; j < 2 * n_ - 1; ++j) {
+                ab[j] = result[j] % p_;
             }
-            std::chrono::duration<double,std::ratio<1,1000>>elapsed = End - Start;
+            std::chrono::duration<double, std::ratio<1,1000>> elapsed = End - Start;
             ans += elapsed.count();
         }
         fCheck(ab, n_, i);
-        std::cout << "average latency for n = " << n_ << " p = " << p_ << " : " << double(ans / epochs) << " (us) " << std::endl;
+        std::cout << "GPU average latency for n = " << n_ << " p = " << p_ 
+                  << " : " << double(ans / epochs) << " (us) " << std::endl;
         fWrite(ab, n_, i);
     }
     return 0;
