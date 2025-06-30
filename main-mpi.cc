@@ -679,7 +679,8 @@ int main(int argc, char *argv[])
         {
             auto Start = std::chrono::high_resolution_clock::now();
 
-            if (p_ < (1ULL << 50)) 
+            // if (p_ < (1ULL << 50)) 
+            if(false)
             {
                 if (rank == 0) 
                 {

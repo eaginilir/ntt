@@ -24,7 +24,8 @@
 // 可以自行添加需要的头文件
 
 void fRead(uint64_t *a, uint64_t *b, uint64_t *n, uint64_t *p, int input_id){
-    std::string strin = "D:\\study\\concurrent processing\\NTT\\ntt\\nttdata\\4.in";
+    // std::string strin = "D:\\study\\concurrent processing\\NTT\\ntt\\nttdata\\4.in";
+    std::string strin = "nttdata/" + std::to_string(input_id) + ".in";
     std::ifstream fin(strin);
 
     if (!fin.is_open()) {
@@ -52,7 +53,8 @@ void fRead(uint64_t *a, uint64_t *b, uint64_t *n, uint64_t *p, int input_id){
 void fCheck(uint64_t *ab, int n, int input_id){
     // 判断多项式乘法结果是否正确
     std::string logout = "files/log.out";
-    std::string strin = "D:\\study\\concurrent processing\\NTT\\ntt\\nttdata\\4.out";
+    // std::string strin = "D:\\study\\concurrent processing\\NTT\\ntt\\nttdata\\4.out";
+    std::string strin = "nttdata/" + std::to_string(input_id) + ".out";
     std::ifstream fin;
     std::ofstream fout(logout, std::ios::app);
     fin.open(strin, std::ios::in);
@@ -95,7 +97,8 @@ void fCheck(uint64_t *ab, int n, int input_id){
 
 void fWrite(uint64_t *ab, int n, int input_id){
     // 数据输出函数, 可以用来输出最终结果, 也可用于调试时输出中间数组
-    std::string strout = "D:\\study\\concurrent processing\\NTT\\ntt\\files\\4.out";
+    // std::string strout = "D:\\study\\concurrent processing\\NTT\\ntt\\files\\4.out";
+    std::string strout = "files/" + std::to_string(input_id) + ".out";
     std::ofstream fout;
     fout.open(strout, std::ios::out);
     for (int i = 0; i < n * 2 - 1; i++){
@@ -778,7 +781,7 @@ int main(int argc, char *argv[])
     // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
     // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
     // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
-    int test_begin = 4;
+    int test_begin = 0;
     int test_end = 4;
     for(int i = test_begin; i <= test_end; ++i){
         long double ans = 0;
