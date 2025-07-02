@@ -518,6 +518,33 @@ void *ModMul_worker(void *args)
     return nullptr;
 }
 
+// 优化的ModMul_worker函数，使用SIMD
+void ModMul_worker_simd(ModMulTaskArgs* args) 
+{
+    const auto& a = *(args->a);
+    const auto& b = *(args->b);
+    auto& c = *(args->c);
+    montgomery* m = args->m;
+    int start = args->start;
+    int end = args->end;
+    
+    // SIMD处理，每次处理2个元素
+    int i = start;
+    for (; i + 1 < end; i += 2) 
+    {
+        uint64x2_t va = vld1q_u64(&a[i]);
+        uint64x2_t vb = vld1q_u64(&b[i]);
+        uint64x2_t result = m->ModMulSIMD(va, vb);
+        vst1q_u64(&c[i], result);
+    }
+    
+    // 处理剩余元素
+    for (; i < end; ++i) 
+    {
+        c[i] = m->ModMul(a[i], b[i]);
+    }
+}
+
 struct NTTTaskArgs 
 {
     std::vector<uint64_t>* a;
@@ -557,6 +584,65 @@ void ntt_worker(NTTTaskArgs* args)
             uint64_t v = m.ModMul(w, A[jj + len / 2]);
             A[jj] = m.montgomery_add(u, v, p);
             A[jj + len / 2] = m.montgomery_sub(u, v, p);
+        }
+    }
+}
+
+// 添加SIMD优化的NTT工作函数
+void ntt_worker_simd(NTTTaskArgs* args) 
+{
+    auto& a = *args->a;
+    montgomery& m = *args->m;
+    uint64_t p = args->p;
+    int len = args->len;
+    uint64_t wnR = args->wnR;
+    int start_block = args->start_block, end_block = args->end_block;
+
+    // 预计算w表，并转换为SIMD友好的格式
+    std::vector<uint64_t> w_table(len / 2);
+    uint64_t w_mont = m.toMont(1);
+    for (int j = 0; j < len / 2; ++j) 
+    {
+        w_table[j] = w_mont;
+        w_mont = m.ModMul(w_mont, wnR);
+    }
+
+    uint64x2_t vec_p = vdupq_n_u64(p);
+    
+    for (int b = start_block; b < end_block; ++b)
+    {
+        int i = b * len;
+        uint64_t* A = &a[i];
+        
+        // SIMD优化的蝶形运算，每次处理2对数据
+        for (int jj = 0; jj < len / 2; jj += 2) 
+        {
+            if (jj + 1 < len / 2) {
+                // 加载权重
+                uint64x2_t w = vld1q_u64(&w_table[jj]);
+                
+                // 加载数据
+                uint64x2_t u = vld1q_u64(&A[jj]);
+                uint64x2_t v_data = vld1q_u64(&A[jj + len / 2]);
+                
+                // v = w * A[jj + len/2] (Montgomery乘法)
+                uint64x2_t v = m.ModMulSIMD(w, v_data);
+                
+                // 蝶形运算
+                uint64x2_t add_result = m.ModAddSIMD(u, v);
+                uint64x2_t sub_result = m.ModSubSIMD(u, v);
+                
+                // 存储结果
+                vst1q_u64(&A[jj], add_result);
+                vst1q_u64(&A[jj + len / 2], sub_result);
+            } else {
+                // 处理剩余的单个元素
+                uint64_t w = w_table[jj];
+                uint64_t u = A[jj];
+                uint64_t v = m.ModMul(w, A[jj + len / 2]);
+                A[jj] = m.montgomery_add(u, v, p);
+                A[jj + len / 2] = m.montgomery_sub(u, v, p);
+            }
         }
     }
 }
@@ -650,6 +736,80 @@ void NTT_iterative(std::vector<uint64_t> &a, int n, uint64_t p, int inv, montgom
     }
 }
 
+// 优化的NTT函数，使用SIMD版本的工作函数
+void NTT_iterative_simd(std::vector<uint64_t> &a, int n, uint64_t p, int inv, montgomery &m) 
+{
+    int g = 3; // 原根
+    bit_reverse(a, n); // 位反转置换
+
+    for(int len = 2; len <= n; len<<=1) 
+    {
+        uint64_t wn = power(g, (p - 1) / len, p);
+        if(inv == -1) 
+        {
+            wn = power(wn, p - 2, p);
+        }
+        uint64_t wnR = m.toMont(wn);
+
+        int total_blocks = n / len;
+        int num_threads = std::min(MAX_THREADS, total_blocks);
+        int chunk = (total_blocks + num_threads - 1) / num_threads;
+
+        std::vector<NTTTaskArgs> args(num_threads);
+
+        for (int t = 0; t < num_threads; ++t) 
+        {
+            int start = t * chunk;
+            int end = std::min(start + chunk, total_blocks);
+            args[t] = NTTTaskArgs{&a, n, p, len, wnR, start, end, &m};
+            
+            global_thread_pool->enqueue([t, &args]() 
+            {
+                ntt_worker_simd(&args[t]); // 使用SIMD版本
+            });
+        }
+
+        global_thread_pool->waitForAll();
+    }
+
+    if(inv == -1) 
+    {
+        uint64_t inv_n = power(n, p - 2, p);
+        uint64_t invR = m.toMont(inv_n);
+
+        int num_threads = std::min(MAX_THREADS, n);
+        int chunk = (n + num_threads - 1) / num_threads;
+        
+        std::vector<std::pair<int, int>> ranges(num_threads);
+        for (int t = 0; t < num_threads; ++t) 
+        {
+            int start = t * chunk;
+            int end = std::min(start + chunk, n);
+            ranges[t] = {start, end};
+            
+            global_thread_pool->enqueue([&a, &m, invR, start, end]() 
+            {
+                // SIMD优化的逆变换后处理
+                int i = start;
+                uint64x2_t vinv = vdupq_n_u64(invR);
+                for (; i + 1 < end; i += 2) 
+                {
+                    uint64x2_t va = vld1q_u64(&a[i]);
+                    uint64x2_t result = m.ModMulSIMD(va, vinv);
+                    vst1q_u64(&a[i], result);
+                }
+                // 处理剩余元素
+                for (; i < end; ++i) 
+                {
+                    a[i] = m.ModMul(a[i], invR);
+                }
+            });
+        }
+
+        global_thread_pool->waitForAll();
+    }
+}
+
 struct CRTTaskArgs
 {
     std::vector<uint64_t> *a;
@@ -694,6 +854,41 @@ void CRT_worker(CRTTaskArgs* args)
     global_thread_pool->waitForAll();
     
     NTT_iterative(result, len, p, -1, m);
+    m.fromMontgomery(result);
+}
+
+void CRT_worker_simd(CRTTaskArgs* args) 
+{
+    auto& a = *args->a;
+    auto& b = *args->b;
+    auto& result = *args->result;
+    montgomery& m = *args->m;
+    int len = args->len;
+    uint64_t p = args->p;
+
+    NTT_iterative_simd(a, len, p, 1, m);  // 使用SIMD版本
+    NTT_iterative_simd(b, len, p, 1, m);  // 使用SIMD版本
+
+    int num_chunks = MAX_THREADS;
+    int chunk_size = (len + num_chunks - 1) / num_chunks;
+    
+    std::vector<ModMulTaskArgs> mul_args(num_chunks);
+    
+    for (int t = 0; t < num_chunks; ++t) 
+    {
+        int start = t * chunk_size;
+        int end = std::min(start + chunk_size, len);
+        mul_args[t] = ModMulTaskArgs{&a, &b, &result, start, end, &m};
+        
+        global_thread_pool->enqueue([t, &mul_args]() 
+        {
+            ModMul_worker_simd(&mul_args[t]); // 使用SIMD版本
+        });
+    }
+
+    global_thread_pool->waitForAll();
+    
+    NTT_iterative_simd(result, len, p, -1, m); // 使用SIMD版本
     m.fromMontgomery(result);
 }
 
@@ -918,7 +1113,7 @@ int main(int argc, char *argv[])
         memset(ab, 0, sizeof(ab));
         // uint64_t R = 1ULL << 32;
         //换大数有利于减少REDC的次数
-        uint64_t R = 1ULL << 60;
+        uint64_t R = 1ULL << 63;
         montgomery m(R, p_);
         //多模数分解
         //基本能确定是四个模数的问题了，这四个模数还是太小了
@@ -950,6 +1145,8 @@ int main(int argc, char *argv[])
         {
             m.toMontgomery(a_1);
             m.toMontgomery(b_1);
+            // NTT_iterative_simd(a_1, len, p_, 1, m);
+            // NTT_iterative_simd(b_1, len, p_, 1, m);
             NTT_iterative(a_1, len, p_, 1, m);
             NTT_iterative(b_1, len, p_, 1, m);
             // 使用线程池进行点乘
@@ -964,12 +1161,13 @@ int main(int argc, char *argv[])
                 
                 global_thread_pool->enqueue([t, &mul_args]() 
                 {
-                    ModMul_worker(&mul_args[t]);
+                    ModMul_worker_simd(&mul_args[t]);
                 });
             }
             
             // 等待所有点乘任务完成
             global_thread_pool->waitForAll();
+            // NTT_iterative_simd(c, len, p_, -1, m);
             NTT_iterative(c, len, p_, -1, m);
             m.fromMontgomery(c);
         }
@@ -996,6 +1194,7 @@ int main(int argc, char *argv[])
             for (int k = 0; k < 4; ++k) 
             {
                 crt_args[k] = CRTTaskArgs{&a_mods[k], &b_mods[k], &res_mods[k], mods[k], len, &montgomery_instances[k]};
+                // CRT_worker_simd(&crt_args[k]);
                 CRT_worker(&crt_args[k]);
             }
             
